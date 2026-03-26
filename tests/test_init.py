@@ -287,3 +287,144 @@ def test_mnn_correct_adata_missing_reference_raises() -> None:
         mnn_correct_adata(adata, batch_key="batch", use_rep="X_test",
                           reference="ghost_batch", verbose=False)
 
+
+# ──────────────────────────────────────────────────────────────────────────── #
+# store_for_projection tests
+# ──────────────────────────────────────────────────────────────────────────── #
+
+def test_store_for_projection_populates_dict() -> None:
+    emb_ref = _make_batch(40, 8, 0.0)
+    emb_query = _make_batch(40, 8, 2.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
+                             store_for_projection=True, verbose=False)
+    corrector.fit(emb_ref, emb_query, batch_label="query_batch")
+
+    assert "query_batch" in corrector.projection_data_
+    d = corrector.projection_data_["query_batch"]
+    assert set(d.keys()) == {"emb_anchor", "disp_anchor", "emb_all", "disp_propagated"}
+    assert d["emb_anchor"].shape[0] == corrector.n_query_with_mnn_
+    assert d["emb_all"].shape[0] == emb_query.shape[0]
+    assert d["disp_propagated"].shape == emb_query.shape
+
+
+def test_store_for_projection_false_empty_dict() -> None:
+    emb_ref = _make_batch(40, 8)
+    emb_query = _make_batch(40, 8, 2.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
+                             store_for_projection=False, verbose=False)
+    corrector.fit(emb_ref, emb_query, batch_label="q")
+    assert corrector.projection_data_ == {}
+
+
+def test_transform_with_batch_anchor() -> None:
+    """transform(batch=..., use_propagated=False) uses anchor-cell reference."""
+    emb_ref = _make_batch(60, 8, 0.0)
+    emb_query = _make_batch(60, 8, 3.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=15,
+                             store_for_projection=True, verbose=False)
+    corrector.fit(emb_ref, emb_query, batch_label="q")
+
+    emb_new = _make_batch(20, 8, 3.0, seed=42)
+    out = corrector.transform(emb_new, batch="q", use_propagated=False)
+    assert out.shape == emb_new.shape
+    # Should be closer to ref than raw
+    ref_center = emb_ref.mean(axis=0)
+    assert (np.linalg.norm(out.mean(0) - ref_center)
+            < np.linalg.norm(emb_new.mean(0) - ref_center))
+
+
+def test_transform_with_batch_propagated() -> None:
+    """transform(batch=..., use_propagated=True) uses all-cell reference."""
+    emb_ref = _make_batch(60, 8, 0.0)
+    emb_query = _make_batch(60, 8, 3.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=15,
+                             store_for_projection=True, verbose=False)
+    corrector.fit(emb_ref, emb_query, batch_label="q")
+
+    emb_new = _make_batch(20, 8, 3.0, seed=42)
+    out = corrector.transform(emb_new, batch="q", use_propagated=True)
+    assert out.shape == emb_new.shape
+    ref_center = emb_ref.mean(axis=0)
+    assert (np.linalg.norm(out.mean(0) - ref_center)
+            < np.linalg.norm(emb_new.mean(0) - ref_center))
+
+
+def test_fit_transform_reuses_stored_propagation() -> None:
+    """fit_transform with store_for_projection should give the same result as
+    fit + transform(batch=..., use_propagated=True)."""
+    emb_ref = _make_batch(50, 8, 0.0)
+    emb_query = _make_batch(50, 8, 2.0, seed=1)
+
+    c1 = MNNCorrector(k_mnn=5, k_propagate=10, store_for_projection=True, verbose=False)
+    out1 = c1.fit_transform(emb_ref, emb_query, batch_label="q")
+
+    c2 = MNNCorrector(k_mnn=5, k_propagate=10, store_for_projection=True, verbose=False)
+    c2.fit(emb_ref, emb_query, batch_label="q")
+    out2 = c2.transform(emb_query, batch="q", use_propagated=True)
+
+    np.testing.assert_array_almost_equal(out1, out2)
+
+
+def test_transform_batch_not_found_raises() -> None:
+    emb_ref = _make_batch(40, 8)
+    emb_query = _make_batch(40, 8, 2.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, store_for_projection=True, verbose=False)
+    corrector.fit(emb_ref, emb_query, batch_label="q1")
+
+    with pytest.raises(KeyError, match="q2"):
+        corrector.transform(emb_query, batch="q2")
+
+
+def test_transform_batch_without_store_raises() -> None:
+    emb_ref = _make_batch(40, 8)
+    emb_query = _make_batch(40, 8, 2.0, seed=1)
+    corrector = MNNCorrector(k_mnn=5, store_for_projection=False, verbose=False)
+    corrector.fit(emb_ref, emb_query)
+
+    with pytest.raises(ValueError, match="store_for_projection"):
+        corrector.transform(emb_query, batch="some_batch")
+
+
+def test_multiple_batches_stored() -> None:
+    """fit() called twice with different batch_labels stores data for each."""
+    emb_ref = _make_batch(40, 8, 0.0)
+    emb_q1 = _make_batch(40, 8, 2.0, seed=1)
+    emb_q2 = _make_batch(40, 8, -2.0, seed=2)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
+                             store_for_projection=True, verbose=False)
+    corrector.fit(emb_ref, emb_q1, batch_label="batch1")
+    corrector.fit(emb_ref, emb_q2, batch_label="batch2")
+
+    assert "batch1" in corrector.projection_data_
+    assert "batch2" in corrector.projection_data_
+    # Each entry should reflect the correct number of cells
+    assert corrector.projection_data_["batch1"]["emb_all"].shape[0] == 40
+    assert corrector.projection_data_["batch2"]["emb_all"].shape[0] == 40
+
+
+def test_mnn_correct_store_for_projection_param() -> None:
+    """mnn_correct() should pass store_for_projection and batch_label through."""
+    adata_ref, adata_query = _make_adata_pair()
+    corrector = mnn_correct_fn(
+        adata_ref, adata_query,
+        use_rep="X_test", k_mnn=5, k_propagate=10,
+        store_for_projection=True, batch_label="my_query",
+        verbose=False,
+    )
+    assert corrector.store_for_projection
+    assert "my_query" in corrector.projection_data_
+
+
+def test_mnn_correct_adata_store_for_projection() -> None:
+    """mnn_correct_adata() should store projection data keyed by query batch label."""
+    adata = _make_combined_adata(n_per_batch=40, n_batches=3)
+    _, correctors = mnn_correct_adata(
+        adata, batch_key="batch", use_rep="X_test",
+        batch_order=["batch0", "batch1", "batch2"],
+        k_mnn=5, k_propagate=10,
+        store_for_projection=True, verbose=False,
+    )
+    # Round 1 corrector should have "batch1"; round 2 should have "batch2"
+    assert "batch1" in correctors[0].projection_data_
+    assert "batch2" in correctors[1].projection_data_
+
