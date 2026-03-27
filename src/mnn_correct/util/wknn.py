@@ -22,6 +22,11 @@ def gaussian_kernel(d, sigma=None):
         Array of distances.
     sigma
         Bandwidth.  Defaults to ``max(d) / 3``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Distance values transformed by a Gaussian kernel.
     """
     if sigma is None:
         sigma = np.max(d) / 3
@@ -50,6 +55,11 @@ def nn2adj(
         ``"gaussian_kernel"``: Gaussian-kernel-transformed distances.
     sigma
         Bandwidth for the Gaussian kernel (ignored unless ``weight="gaussian_kernel"``).
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        Sparse adjacency matrix with shape ``(n1, n2)``.
     """
     if n1 is None:
         n1 = nn[0].shape[0]
@@ -222,9 +232,10 @@ def get_wknn(
 
     Returns
     -------
-    wknn : scipy.sparse.csr_matrix, shape ``(n_ref, n_query)``
-    (wknn, adjs) : tuple
-        Only when ``return_adjs=True``.
+    scipy.sparse.csr_matrix or tuple
+        Weighted KNN matrix with shape ``(n_ref, n_query)``. When
+        ``return_adjs=True``, returns ``(wknn, adjs)`` where ``adjs`` contains
+        the intermediate adjacency matrices used during construction.
     """
     weight_for_nn = "dist" if weighting_scheme in ("gaussian", "dist") else "unweighted"
 

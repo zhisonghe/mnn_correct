@@ -1,58 +1,102 @@
-import numpy as np
 import anndata as ad
+import numpy as np
 import pandas as pd
 import pytest
+from scipy import sparse
 
 import mnn_correct
 from mnn_correct import MNNCorrector, mnn_correct as mnn_correct_fn, mnn_correct_adata
 
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# Fixtures
-# ──────────────────────────────────────────────────────────────────────────── #
 
 def _make_batch(n: int = 40, d: int = 8, shift: float = 0.0, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.standard_normal((n, d)) + shift
 
 
-def _make_adata_pair(
-    n_ref: int = 40, n_query: int = 40, d: int = 8, shift: float = 2.0, seed: int = 0
-):
-    """Returns (adata_ref, adata_query) with a known shift between batches."""
-    emb_ref = _make_batch(n_ref, d, 0.0, seed)
-    emb_query = _make_batch(n_query, d, shift, seed + 1)
-
-    def _adata(emb, prefix):
-        obs = pd.DataFrame(index=[f"{prefix}_{i}" for i in range(len(emb))])
-        a = ad.AnnData(X=np.zeros((len(emb), 1)), obs=obs)
-        a.obsm["X_test"] = emb
-        return a
-
-    return _adata(emb_ref, "ref"), _adata(emb_query, "query")
-
-
 def _make_combined_adata(
-    n_per_batch: int = 40, d: int = 8, n_batches: int = 3, seed: int = 0
+    n_per_batch: int = 40,
+    d: int = 8,
+    n_batches: int = 3,
+    shift_scale: float = 2.0,
+    seed: int = 0,
 ) -> ad.AnnData:
-    """Returns a combined AnnData with n_batches batches, each shifted."""
     rng = np.random.default_rng(seed)
     adatas = []
-    for b in range(n_batches):
-        emb = rng.standard_normal((n_per_batch, d)) + b * 2.0
+    for batch_index in range(n_batches):
+        emb = rng.standard_normal((n_per_batch, d)) + batch_index * shift_scale
         obs = pd.DataFrame(
-            {"batch": [f"batch{b}"] * n_per_batch},
-            index=[f"b{b}_cell{i}" for i in range(n_per_batch)],
+            {"batch": [f"batch{batch_index}"] * n_per_batch},
+            index=[f"b{batch_index}_cell{i}" for i in range(n_per_batch)],
         )
-        a = ad.AnnData(X=np.zeros((n_per_batch, 1)), obs=obs)
-        a.obsm["X_test"] = emb
-        adatas.append(a)
+        adata = ad.AnnData(X=np.zeros((n_per_batch, 4)), obs=obs)
+        adata.obsm["X_test"] = emb
+        adatas.append(adata)
     return ad.concat(adatas)
 
 
-# ──────────────────────────────────────────────────────────────────────────── #
-# Package-level smoke tests
-# ──────────────────────────────────────────────────────────────────────────── #
+def _make_adata_pair(
+    n_ref: int = 40,
+    n_query: int = 40,
+    d: int = 8,
+    shift: float = 2.0,
+    seed: int = 0,
+) -> tuple[ad.AnnData, ad.AnnData]:
+    emb_ref = _make_batch(n_ref, d, 0.0, seed)
+    emb_query = _make_batch(n_query, d, shift, seed + 1)
+
+    ref_obs = pd.DataFrame(index=[f"ref_{i}" for i in range(n_ref)])
+    query_obs = pd.DataFrame(index=[f"query_{i}" for i in range(n_query)])
+
+    adata_ref = ad.AnnData(X=np.zeros((n_ref, 4)), obs=ref_obs)
+    adata_query = ad.AnnData(X=np.zeros((n_query, 4)), obs=query_obs)
+    adata_ref.obsm["X_test"] = emb_ref
+    adata_query.obsm["X_test"] = emb_query
+    return adata_ref, adata_query
+
+
+def _make_sparse_adata_pair(
+    n_ref: int = 40,
+    n_query: int = 40,
+    d: int = 12,
+    shift: float = 1.0,
+    seed: int = 0,
+) -> tuple[ad.AnnData, ad.AnnData]:
+    rng = np.random.default_rng(seed)
+    ref = rng.poisson(1.5, size=(n_ref, d)).astype(float)
+    query = rng.poisson(1.5, size=(n_query, d)).astype(float)
+    query[:, : max(1, d // 3)] += shift
+
+    adata_ref = ad.AnnData(
+        X=sparse.csr_matrix(ref),
+        obs=pd.DataFrame(index=[f"ref_sparse_{i}" for i in range(n_ref)]),
+    )
+    adata_query = ad.AnnData(
+        X=sparse.csr_matrix(query),
+        obs=pd.DataFrame(index=[f"query_sparse_{i}" for i in range(n_query)]),
+    )
+    return adata_ref, adata_query
+
+
+def _make_sparse_combined_adata(
+    n_per_batch: int = 40,
+    d: int = 12,
+    n_batches: int = 2,
+    shift_scale: float = 1.0,
+    seed: int = 0,
+) -> ad.AnnData:
+    rng = np.random.default_rng(seed)
+    adatas = []
+    feature_span = max(1, d // 3)
+    for batch_index in range(n_batches):
+        X = rng.poisson(1.5, size=(n_per_batch, d)).astype(float)
+        X[:, :feature_span] += batch_index * shift_scale
+        obs = pd.DataFrame(
+            {"batch": [f"batch{batch_index}"] * n_per_batch},
+            index=[f"s{batch_index}_cell{i}" for i in range(n_per_batch)],
+        )
+        adatas.append(ad.AnnData(X=sparse.csr_matrix(X), obs=obs))
+    return ad.concat(adatas)
+
 
 def test_version() -> None:
     assert mnn_correct.__version__ == "0.1.0"
@@ -64,126 +108,239 @@ def test_public_api() -> None:
     assert hasattr(mnn_correct, "mnn_correct_adata")
 
 
-# ──────────────────────────────────────────────────────────────────────────── #
-# MNNCorrector unit tests
-# ──────────────────────────────────────────────────────────────────────────── #
-
-def test_corrector_fit_stores_state() -> None:
-    emb_ref = _make_batch(40, 8, 0.0)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
+def test_corrector_fit_stores_batch_models() -> None:
+    adata = _make_combined_adata(n_batches=3)
     corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
-    corrector.fit(emb_ref, emb_query)
+
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1", "batch2"],
+        use_rep="X_test",
+    )
 
     assert corrector.is_fitted
+    assert corrector.n_corrections_ == 2
+    assert set(corrector.projection_data_) == {"batch1", "batch2"}
+    assert corrector.key_added_ == "X_test_mnn_corrected"
     assert corrector.n_mnn_pairs_ > 0
     assert corrector.n_query_with_mnn_ > 0
-    assert corrector.emb_query_with_mnn_ is not None
-    assert corrector.avg_disp_ is not None
-    assert corrector.avg_disp_.shape[1] == 8
 
 
-def test_corrector_transform_shape() -> None:
-    emb_ref = _make_batch(40, 8, 0.0)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
+def test_corrector_correct_writes_obsm() -> None:
+    adata = _make_combined_adata(n_batches=2)
     corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
-    corrector.fit(emb_ref, emb_query)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
 
-    emb_new = _make_batch(20, 8, 2.0, seed=99)
-    corrected = corrector.transform(emb_new)
-    assert corrected.shape == emb_new.shape
+    corrector.correct(adata)
 
-
-def test_corrector_transform_reduces_distance() -> None:
-    """Transformed query cells should be closer to ref centroid."""
-    emb_ref = _make_batch(60, 8, 0.0)
-    emb_query = _make_batch(60, 8, 3.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=15, verbose=False)
-    corrector.fit(emb_ref, emb_query)
-
-    emb_new = _make_batch(30, 8, 3.0, seed=42)
-    corrected = corrector.transform(emb_new)
-
-    ref_center = emb_ref.mean(axis=0)
-    assert np.linalg.norm(corrected.mean(axis=0) - ref_center) < \
-           np.linalg.norm(emb_new.mean(axis=0) - ref_center)
+    assert "X_test_mnn_corrected" in adata.obsm
+    assert adata.obsm["X_test_mnn_corrected"].shape == adata.obsm["X_test"].shape
 
 
-def test_corrector_not_fitted_transform_raises() -> None:
+def test_corrector_correct_reduces_distance() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+    corrector.correct(adata)
+
+    ref_mask = adata.obs["batch"] == "batch0"
+    query_mask = adata.obs["batch"] == "batch1"
+    ref_center = adata.obsm["X_test"][ref_mask].mean(axis=0)
+    before = adata.obsm["X_test"][query_mask].mean(axis=0)
+    after = adata.obsm["X_test_mnn_corrected"][query_mask].mean(axis=0)
+
+    assert np.linalg.norm(after - ref_center) < np.linalg.norm(before - ref_center)
+
+
+def test_corrector_project_writes_obsm() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    new_obs = pd.DataFrame(index=[f"new_{i}" for i in range(20)])
+    adata_new = ad.AnnData(X=np.zeros((20, 4)), obs=new_obs)
+    adata_new.obsm["X_test"] = _make_batch(20, 8, 3.0, seed=99)
+
+    corrector.project(adata_new, batch_label="batch1")
+
+    assert "X_test_mnn_corrected" in adata_new.obsm
+    assert adata_new.obsm["X_test_mnn_corrected"].shape == adata_new.obsm["X_test"].shape
+
+
+def test_corrector_project_reduces_distance() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    adata_new = ad.AnnData(
+        X=np.zeros((20, 4)),
+        obs=pd.DataFrame(index=[f"new_{i}" for i in range(20)]),
+    )
+    adata_new.obsm["X_test"] = _make_batch(20, 8, 3.0, seed=101)
+    corrector.project(adata_new, batch_label="batch1")
+
+    ref_mask = adata.obs["batch"] == "batch0"
+    ref_center = adata.obsm["X_test"][ref_mask].mean(axis=0)
+    before = adata_new.obsm["X_test"].mean(axis=0)
+    after = adata_new.obsm["X_test_mnn_corrected"].mean(axis=0)
+
+    assert np.linalg.norm(after - ref_center) < np.linalg.norm(before - ref_center)
+
+
+def test_corrector_correct_before_fit_raises() -> None:
     corrector = MNNCorrector(verbose=False)
-    with pytest.raises(RuntimeError, match="fitted"):
-        corrector.transform(np.zeros((5, 8)))
+    adata = _make_combined_adata(n_batches=2)
+
+    with pytest.raises(RuntimeError, match="fit"):
+        corrector.correct(adata)
 
 
-def test_corrector_fit_transform_equivalent() -> None:
-    emb_ref = _make_batch(40, 8, 0.0)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-
-    c1 = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
-    out1 = c1.fit_transform(emb_ref, emb_query)
-
-    c2 = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
-    c2.fit(emb_ref, emb_query)
-    out2 = c2.transform(emb_query)
-
-    np.testing.assert_array_almost_equal(out1, out2)
-
-
-def test_corrector_obs_names_indexed() -> None:
-    emb_ref = _make_batch(40, 8)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-    names = pd.Index([f"cell_{i}" for i in range(40)])
+def test_corrector_project_unknown_batch_raises() -> None:
+    adata = _make_combined_adata(n_batches=2)
     corrector = MNNCorrector(k_mnn=5, verbose=False)
-    corrector.fit(emb_ref, emb_query, obs_names_query=names)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
 
-    assert corrector.obs_names_with_mnn_ is not None
-    assert corrector.obs_names_with_mnn_.isin(names).all()
+    adata_new = ad.AnnData(
+        X=np.zeros((5, 4)),
+        obs=pd.DataFrame(index=[f"new_{i}" for i in range(5)]),
+    )
+    adata_new.obsm["X_test"] = _make_batch(5, 8, 2.0, seed=123)
+
+    with pytest.raises(KeyError, match="missing"):
+        corrector.project(adata_new, batch_label="missing")
 
 
-# ──────────────────────────────────────────────────────────────────────────── #
-# mnn_correct (pairwise) tests
-# ──────────────────────────────────────────────────────────────────────────── #
+def test_corrector_correct_requires_same_cells() -> None:
+    adata = _make_combined_adata(n_batches=2)
+    corrector = MNNCorrector(k_mnn=5, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
 
-def test_mnn_correct_returns_corrector() -> None:
+    adata_other = _make_combined_adata(n_batches=2, seed=99)
+    with pytest.raises(ValueError, match="same cells"):
+        corrector.correct(adata_other)
+
+
+def test_corrector_sparse_pca_fit_and_correct() -> None:
+    adata = _make_sparse_combined_adata(n_batches=2)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
+
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep=None,
+    )
+    corrector.correct(adata)
+
+    assert not corrector.store_for_projection
+    assert corrector.projection_data_ == {}
+    assert "X_pca_mnn_corrected" in adata.obsm
+    assert adata.obsm["X_pca_mnn_corrected"].shape[0] == adata.n_obs
+
+
+def test_corrector_sparse_pca_project_raises() -> None:
+    adata = _make_sparse_combined_adata(n_batches=2)
+    corrector = MNNCorrector(
+        k_mnn=5,
+        k_propagate=10,
+        store_for_projection=True,
+        verbose=False,
+    )
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep=None,
+    )
+
+    _, adata_new = _make_sparse_adata_pair(n_ref=20, n_query=20, d=12, shift=1.0, seed=22)
+    with pytest.raises(ValueError, match="Projection is unavailable"):
+        corrector.project(adata_new, batch_label="batch1")
+
+
+def test_mnn_correct_returns_fitted_corrector() -> None:
     adata_ref, adata_query = _make_adata_pair()
-    result = mnn_correct_fn(adata_ref, adata_query, use_rep="X_test",
-                            k_mnn=5, k_propagate=10, verbose=False)
-    assert isinstance(result, MNNCorrector)
-    assert result.is_fitted
 
+    corrector = mnn_correct_fn(
+        adata_ref,
+        adata_query,
+        use_rep="X_test",
+        k_mnn=5,
+        k_propagate=10,
+        batch_label="query_batch",
+        verbose=False,
+    )
 
-def test_mnn_correct_writes_obsm() -> None:
-    adata_ref, adata_query = _make_adata_pair()
-    mnn_correct_fn(adata_ref, adata_query, use_rep="X_test",
-                   k_mnn=5, k_propagate=10, verbose=False)
+    assert isinstance(corrector, MNNCorrector)
+    assert corrector.is_fitted
     assert "X_test_mnn_corrected" in adata_query.obsm
-
-
-def test_mnn_correct_key_added() -> None:
-    adata_ref, adata_query = _make_adata_pair()
-    mnn_correct_fn(adata_ref, adata_query, use_rep="X_test",
-                   key_added="X_my_corrected", k_mnn=5, k_propagate=10, verbose=False)
-    assert "X_my_corrected" in adata_query.obsm
-
-
-def test_mnn_correct_ref_unchanged() -> None:
-    adata_ref, adata_query = _make_adata_pair()
-    emb_ref_before = adata_ref.obsm["X_test"].copy()
-    mnn_correct_fn(adata_ref, adata_query, use_rep="X_test",
-                   k_mnn=5, k_propagate=10, verbose=False)
-    np.testing.assert_array_equal(adata_ref.obsm["X_test"], emb_ref_before)
+    assert "query_batch" in corrector.projection_data_
 
 
 def test_mnn_correct_query_shift_reduced() -> None:
     adata_ref, adata_query = _make_adata_pair(shift=3.0)
-    mnn_correct_fn(adata_ref, adata_query, use_rep="X_test",
-                   k_mnn=5, k_propagate=10, verbose=False)
+
+    mnn_correct_fn(
+        adata_ref,
+        adata_query,
+        use_rep="X_test",
+        k_mnn=5,
+        k_propagate=10,
+        verbose=False,
+    )
 
     ref_center = adata_ref.obsm["X_test"].mean(axis=0)
-    query_before = adata_query.obsm["X_test"].mean(axis=0)
-    query_after = adata_query.obsm["X_test_mnn_corrected"].mean(axis=0)
+    before = adata_query.obsm["X_test"].mean(axis=0)
+    after = adata_query.obsm["X_test_mnn_corrected"].mean(axis=0)
 
-    assert np.linalg.norm(query_after - ref_center) < \
-           np.linalg.norm(query_before - ref_center)
+    assert np.linalg.norm(after - ref_center) < np.linalg.norm(before - ref_center)
+
+
+def test_mnn_correct_ref_unchanged() -> None:
+    adata_ref, adata_query = _make_adata_pair()
+    ref_before = adata_ref.obsm["X_test"].copy()
+
+    mnn_correct_fn(
+        adata_ref,
+        adata_query,
+        use_rep="X_test",
+        k_mnn=5,
+        k_propagate=10,
+        verbose=False,
+    )
+
+    np.testing.assert_array_equal(adata_ref.obsm["X_test"], ref_before)
 
 
 def test_mnn_correct_missing_use_rep_raises() -> None:
@@ -192,239 +349,93 @@ def test_mnn_correct_missing_use_rep_raises() -> None:
         mnn_correct_fn(adata_ref, adata_query, use_rep="X_missing", verbose=False)
 
 
-# ──────────────────────────────────────────────────────────────────────────── #
-# mnn_correct_adata tests
-# ──────────────────────────────────────────────────────────────────────────── #
+def test_mnn_correct_sparse_pca_path() -> None:
+    adata_ref, adata_query = _make_sparse_adata_pair()
 
-def test_mnn_correct_adata_sequential_two_batches() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
-    _, correctors = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
-        batch_order=["batch0", "batch1"],
-        k_mnn=5, k_propagate=10, verbose=False,
+    corrector = mnn_correct_fn(
+        adata_ref,
+        adata_query,
+        use_rep=None,
+        k_mnn=5,
+        k_propagate=10,
+        verbose=False,
     )
-    assert "X_test_mnn_corrected" in adata.obsm
-    assert len(correctors) == 1
+
+    assert corrector.is_fitted
+    assert not corrector.store_for_projection
+    assert corrector.projection_data_ == {}
+    assert "X_pca_mnn_corrected" in adata_query.obsm
 
 
-def test_mnn_correct_adata_sequential_three_batches() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=3)
-    _, correctors = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
+def test_mnn_correct_adata_returns_corrector() -> None:
+    adata = _make_combined_adata(n_batches=3)
+
+    result, corrector = mnn_correct_adata(
+        adata,
+        batch_key="batch",
         batch_order=["batch0", "batch1", "batch2"],
-        k_mnn=5, k_propagate=10, verbose=False,
+        use_rep="X_test",
+        k_mnn=5,
+        k_propagate=10,
+        verbose=False,
     )
+
+    assert result is None
+    assert isinstance(corrector, MNNCorrector)
+    assert corrector.n_corrections_ == 2
     assert "X_test_mnn_corrected" in adata.obsm
-    assert len(correctors) == 2  # 2 correction rounds
-
-
-def test_mnn_correct_adata_ref_batch_unchanged() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=3)
-    ref_emb_before = adata[adata.obs["batch"] == "batch0"].obsm["X_test"].copy()
-
-    mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
-        batch_order=["batch0", "batch1", "batch2"],
-        k_mnn=5, k_propagate=10, verbose=False,
-    )
-
-    ref_emb_after = adata[adata.obs["batch"] == "batch0"].obsm["X_test_mnn_corrected"]
-    np.testing.assert_array_equal(ref_emb_after, ref_emb_before)
-
-
-def test_mnn_correct_adata_fixed_reference() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=3)
-    _, correctors = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
-        reference="batch0",
-        k_mnn=5, k_propagate=10, verbose=False,
-    )
-    assert "X_test_mnn_corrected" in adata.obsm
-    assert len(correctors) == 2  # 2 non-reference batches
 
 
 def test_mnn_correct_adata_copy() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
-    adata_out, _ = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
+    adata = _make_combined_adata(n_batches=2)
+
+    adata_out, corrector = mnn_correct_adata(
+        adata,
+        batch_key="batch",
         batch_order=["batch0", "batch1"],
-        k_mnn=5, k_propagate=10, copy=True, verbose=False,
+        use_rep="X_test",
+        k_mnn=5,
+        k_propagate=10,
+        copy=True,
+        verbose=False,
     )
+
+    assert isinstance(corrector, MNNCorrector)
+    assert adata_out is not None
     assert adata_out is not adata
-    assert "X_test_mnn_corrected" not in adata.obsm  # original untouched
+    assert "X_test_mnn_corrected" not in adata.obsm
     assert "X_test_mnn_corrected" in adata_out.obsm
 
 
-def test_mnn_correct_adata_alphabetical_fallback() -> None:
-    """Without batch_order or reference, batches should be sorted alphabetically."""
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
-    _, correctors = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
-        k_mnn=5, k_propagate=10, verbose=False,
-    )
-    assert len(correctors) == 1
-
-
 def test_mnn_correct_adata_both_order_and_ref_raises() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
+    adata = _make_combined_adata(n_batches=2)
+
     with pytest.raises(ValueError, match="not both"):
         mnn_correct_adata(
-            adata, batch_key="batch", use_rep="X_test",
-            reference="batch0", batch_order=["batch0", "batch1"],
+            adata,
+            batch_key="batch",
+            batch_order=["batch0", "batch1"],
+            reference="batch0",
+            use_rep="X_test",
             verbose=False,
         )
 
 
 def test_mnn_correct_adata_missing_batch_key_raises() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
+    adata = _make_combined_adata(n_batches=2)
+
     with pytest.raises(KeyError, match="batch_key"):
-        mnn_correct_adata(adata, batch_key="nonexistent", use_rep="X_test", verbose=False)
+        mnn_correct_adata(adata, batch_key="missing", use_rep="X_test", verbose=False)
 
 
 def test_mnn_correct_adata_missing_reference_raises() -> None:
-    adata = _make_combined_adata(n_per_batch=40, n_batches=2)
+    adata = _make_combined_adata(n_batches=2)
+
     with pytest.raises(ValueError, match="reference"):
-        mnn_correct_adata(adata, batch_key="batch", use_rep="X_test",
-                          reference="ghost_batch", verbose=False)
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# store_for_projection tests
-# ──────────────────────────────────────────────────────────────────────────── #
-
-def test_store_for_projection_populates_dict() -> None:
-    emb_ref = _make_batch(40, 8, 0.0)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
-                             store_for_projection=True, verbose=False)
-    corrector.fit(emb_ref, emb_query, batch_label="query_batch")
-
-    assert "query_batch" in corrector.projection_data_
-    d = corrector.projection_data_["query_batch"]
-    assert set(d.keys()) == {"emb_anchor", "disp_anchor", "emb_all", "disp_propagated"}
-    assert d["emb_anchor"].shape[0] == corrector.n_query_with_mnn_
-    assert d["emb_all"].shape[0] == emb_query.shape[0]
-    assert d["disp_propagated"].shape == emb_query.shape
-
-
-def test_store_for_projection_false_empty_dict() -> None:
-    emb_ref = _make_batch(40, 8)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
-                             store_for_projection=False, verbose=False)
-    corrector.fit(emb_ref, emb_query, batch_label="q")
-    assert corrector.projection_data_ == {}
-
-
-def test_transform_with_batch_anchor() -> None:
-    """transform(batch=..., use_propagated=False) uses anchor-cell reference."""
-    emb_ref = _make_batch(60, 8, 0.0)
-    emb_query = _make_batch(60, 8, 3.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=15,
-                             store_for_projection=True, verbose=False)
-    corrector.fit(emb_ref, emb_query, batch_label="q")
-
-    emb_new = _make_batch(20, 8, 3.0, seed=42)
-    out = corrector.transform(emb_new, batch="q", use_propagated=False)
-    assert out.shape == emb_new.shape
-    # Should be closer to ref than raw
-    ref_center = emb_ref.mean(axis=0)
-    assert (np.linalg.norm(out.mean(0) - ref_center)
-            < np.linalg.norm(emb_new.mean(0) - ref_center))
-
-
-def test_transform_with_batch_propagated() -> None:
-    """transform(batch=..., use_propagated=True) uses all-cell reference."""
-    emb_ref = _make_batch(60, 8, 0.0)
-    emb_query = _make_batch(60, 8, 3.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=15,
-                             store_for_projection=True, verbose=False)
-    corrector.fit(emb_ref, emb_query, batch_label="q")
-
-    emb_new = _make_batch(20, 8, 3.0, seed=42)
-    out = corrector.transform(emb_new, batch="q", use_propagated=True)
-    assert out.shape == emb_new.shape
-    ref_center = emb_ref.mean(axis=0)
-    assert (np.linalg.norm(out.mean(0) - ref_center)
-            < np.linalg.norm(emb_new.mean(0) - ref_center))
-
-
-def test_fit_transform_reuses_stored_propagation() -> None:
-    """fit_transform with store_for_projection should give the same result as
-    fit + transform(batch=..., use_propagated=True)."""
-    emb_ref = _make_batch(50, 8, 0.0)
-    emb_query = _make_batch(50, 8, 2.0, seed=1)
-
-    c1 = MNNCorrector(k_mnn=5, k_propagate=10, store_for_projection=True, verbose=False)
-    out1 = c1.fit_transform(emb_ref, emb_query, batch_label="q")
-
-    c2 = MNNCorrector(k_mnn=5, k_propagate=10, store_for_projection=True, verbose=False)
-    c2.fit(emb_ref, emb_query, batch_label="q")
-    out2 = c2.transform(emb_query, batch="q", use_propagated=True)
-
-    np.testing.assert_array_almost_equal(out1, out2)
-
-
-def test_transform_batch_not_found_raises() -> None:
-    emb_ref = _make_batch(40, 8)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, store_for_projection=True, verbose=False)
-    corrector.fit(emb_ref, emb_query, batch_label="q1")
-
-    with pytest.raises(KeyError, match="q2"):
-        corrector.transform(emb_query, batch="q2")
-
-
-def test_transform_batch_without_store_raises() -> None:
-    emb_ref = _make_batch(40, 8)
-    emb_query = _make_batch(40, 8, 2.0, seed=1)
-    corrector = MNNCorrector(k_mnn=5, store_for_projection=False, verbose=False)
-    corrector.fit(emb_ref, emb_query)
-
-    with pytest.raises(ValueError, match="store_for_projection"):
-        corrector.transform(emb_query, batch="some_batch")
-
-
-def test_multiple_batches_stored() -> None:
-    """fit() called twice with different batch_labels stores data for each."""
-    emb_ref = _make_batch(40, 8, 0.0)
-    emb_q1 = _make_batch(40, 8, 2.0, seed=1)
-    emb_q2 = _make_batch(40, 8, -2.0, seed=2)
-    corrector = MNNCorrector(k_mnn=5, k_propagate=10,
-                             store_for_projection=True, verbose=False)
-    corrector.fit(emb_ref, emb_q1, batch_label="batch1")
-    corrector.fit(emb_ref, emb_q2, batch_label="batch2")
-
-    assert "batch1" in corrector.projection_data_
-    assert "batch2" in corrector.projection_data_
-    # Each entry should reflect the correct number of cells
-    assert corrector.projection_data_["batch1"]["emb_all"].shape[0] == 40
-    assert corrector.projection_data_["batch2"]["emb_all"].shape[0] == 40
-
-
-def test_mnn_correct_store_for_projection_param() -> None:
-    """mnn_correct() should pass store_for_projection and batch_label through."""
-    adata_ref, adata_query = _make_adata_pair()
-    corrector = mnn_correct_fn(
-        adata_ref, adata_query,
-        use_rep="X_test", k_mnn=5, k_propagate=10,
-        store_for_projection=True, batch_label="my_query",
-        verbose=False,
-    )
-    assert corrector.store_for_projection
-    assert "my_query" in corrector.projection_data_
-
-
-def test_mnn_correct_adata_store_for_projection() -> None:
-    """mnn_correct_adata() should store projection data keyed by query batch label."""
-    adata = _make_combined_adata(n_per_batch=40, n_batches=3)
-    _, correctors = mnn_correct_adata(
-        adata, batch_key="batch", use_rep="X_test",
-        batch_order=["batch0", "batch1", "batch2"],
-        k_mnn=5, k_propagate=10,
-        store_for_projection=True, verbose=False,
-    )
-    # Round 1 corrector should have "batch1"; round 2 should have "batch2"
-    assert "batch1" in correctors[0].projection_data_
-    assert "batch2" in correctors[1].projection_data_
-
+        mnn_correct_adata(
+            adata,
+            batch_key="batch",
+            reference="ghost_batch",
+            use_rep="X_test",
+            verbose=False,
+        )

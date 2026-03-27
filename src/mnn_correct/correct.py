@@ -2,166 +2,59 @@
 
 from __future__ import annotations
 
-import warnings
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from anndata import AnnData
-from scipy.sparse import diags
+import scanpy as sc
+from anndata import AnnData, concat
 
-from .util import wknn
+from .util import WeightingScheme, propagate_weighted, wknn
 
-WeightingScheme = Literal["n", "top_n", "jaccard", "jaccard_square", "gaussian", "dist"]
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# Internal helper: joint PCA fallback
-# ──────────────────────────────────────────────────────────────────────────── #
-
-def _joint_pca(
-    X_ref,
-    X_query,
-    n_components: int = 50,
-    verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Concatenate raw features from ref and query, run PCA, return both embeddings."""
-    import scipy.sparse as sp
-    from sklearn.decomposition import PCA
-
-    if verbose:
-        print(
-            f"[mnn_correct] use_rep=None — running joint PCA "
-            f"(n_components={n_components}) on concatenated data..."
-        )
-
-    def _dense(X):
-        return X.toarray() if sp.issparse(X) else np.asarray(X)
-
-    X_all = np.vstack([_dense(X_ref), _dense(X_query)])
-    n_comp = min(n_components, X_all.shape[0] - 1, X_all.shape[1])
-    X_pca = PCA(n_components=n_comp).fit_transform(X_all)
-
-    n_ref = X_ref.shape[0]
-    return X_pca[:n_ref], X_pca[n_ref:]
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# Internal helper: displacement propagation
-# ──────────────────────────────────────────────────────────────────────────── #
-
-def _propagate_weighted(
-    emb_new: np.ndarray,
-    ref_emb: np.ndarray,
-    ref_disp: np.ndarray,
-    k: int,
-    weighting_scheme: WeightingScheme,
-    nogpu: bool,
-    verbose: bool,
-) -> np.ndarray:
-    """Propagate *ref_disp* to *emb_new* via a weighted KNN graph.
-
-    Builds a KNN graph from *emb_new* (query) to *ref_emb* (reference),
-    row-normalises the weights, and returns the weighted-average displacement
-    for every new cell.
-
-    Parameters
-    ----------
-    emb_new
-        Cells to receive propagated displacement, shape ``(n_new, d)``.
-    ref_emb
-        Reference cells whose displacements are known, shape ``(n_ref, d)``.
-    ref_disp
-        Known displacements at reference cells, shape ``(n_ref, d)``.
-    k, weighting_scheme, nogpu, verbose
-        Passed directly to :func:`~mnn_correct.util.wknn.get_wknn`.
-
-    Returns
-    -------
-    np.ndarray
-        Propagated displacement for *emb_new*, shape ``(n_new, d)``.
-    """
-    k_eff = min(k, ref_emb.shape[0])
-    wknn_prop = wknn.get_wknn(
-        ref=ref_emb,
-        query=emb_new,
-        k=k_eff,
-        query2ref=True,
-        ref2query=False,
-        weighting_scheme=weighting_scheme,
-        nogpu=nogpu,
-        verbose=verbose,
-    )
-    row_sums = np.array(wknn_prop.sum(axis=1)).flatten()
-    row_sums[row_sums == 0] = 1.0  # isolated cells receive zero displacement
-    return diags(1.0 / row_sums).dot(wknn_prop).dot(ref_disp)
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# MNNCorrector — stateful correction model
-# ──────────────────────────────────────────────────────────────────────────── #
 
 class MNNCorrector:
-    """Stateful MNN-based batch correction model.
+    """Stateful MNN batch-correction model for AnnData workflows.
 
-    Estimates per-cell correction displacements from MNN pairs between one or
-    more query batches and the reference, and — when
-    ``store_for_projection=True`` — can project any new query cells onto a
-    previously fitted batch without re-fitting.
+    The main workflow is:
+
+    1. :meth:`fit` estimates per-batch displacement models from a training
+       :class:`~anndata.AnnData` object.
+    2. :meth:`correct` writes the fitted correction back into an AnnData object
+       containing the same cells used during fitting.
+    3. :meth:`project` propagates a previously estimated batch displacement to
+       new cells that belong to an already fitted batch label.
 
     Parameters
     ----------
     k_mnn
-        Number of nearest neighbours used when identifying MNN pairs.
+        Number of nearest neighbours used when detecting mutual nearest
+        neighbour pairs.
     k_propagate
-        Number of nearest neighbours used when propagating displacement from
-        anchor cells (those with MNNs) to all query cells.
+        Number of neighbours used when propagating anchor-cell displacements
+        to the full query batch.
     weighting_scheme
-        Edge-weighting scheme for the propagation graph.
+        Weighting scheme passed to the weighted KNN propagation graph.
     store_for_projection
-        If ``True``, :meth:`fit` additionally computes and saves the
-        *propagated* displacement for **all** query cells together with their
-        raw embeddings, keyed by *batch_label*.  This enables projecting new
-        (unseen) cells onto a fitted batch via :meth:`transform` later.
+        Whether to retain per-batch projection state after fitting. When
+        ``use_rep=None``, this is forced to ``False`` because the PCA fallback
+        only supports the current correction run.
     nogpu
-        Force CPU-based neighbour search.
+        If ``True``, force CPU-based neighbour search even when GPU support is
+        available.
     verbose
-        Print progress messages.
+        If ``True``, print progress messages during fitting and projection.
 
-    Attributes (available after :meth:`fit`)
-    -----------------------------------------
-    emb_query_with_mnn_ : np.ndarray, shape (n_anchors, d)
-        Latent embeddings of query anchor cells (those with ≥1 MNN) from the
-        most recently fitted batch.
-    avg_disp_ : np.ndarray, shape (n_anchors, d)
-        Per-anchor average MNN displacement from the most recently fitted batch.
-    obs_names_with_mnn_ : pd.Index
-        Observation names of anchor cells from the most recently fitted batch.
-    n_mnn_pairs_ : int
-        Total MNN pairs found in the most recent fit.
-    n_query_with_mnn_ : int
-        Number of unique query anchor cells in the most recent fit.
-    projection_data_ : dict
-        Per-batch projection store (only populated when
-        ``store_for_projection=True``).  Keys are the *batch_label* strings
-        passed to :meth:`fit`; values are dicts with four arrays:
-
-        * ``"emb_anchor"``      — embeddings of MNN-anchor cells ``(n_anchors, d)``
-        * ``"disp_anchor"``     — raw MNN displacements of anchor cells ``(n_anchors, d)``
-        * ``"emb_all"``         — embeddings of *all* query cells ``(n_all, d)``
-        * ``"disp_propagated"`` — smoothed displacement for all query cells ``(n_all, d)``
-
-    Examples
-    --------
-    >>> corrector = MNNCorrector(k_mnn=10, k_propagate=20, store_for_projection=True)
-    >>> corrector.fit(emb_ref, emb_query, obs_names_query=adata_q.obs_names,
-    ...               batch_label="batch1")
-    >>> # Correct training cells (reuses stored propagation — no extra compute):
-    >>> emb_corrected = corrector.fit_transform(
-    ...     emb_ref, emb_query, batch_label="batch1")
-    >>> # Project new unseen cells from the same batch:
-    >>> emb_new_corrected = corrector.transform(
-    ...     emb_new, batch="batch1", use_propagated=True)
+    Attributes
+    ----------
+    projection_data_
+        Mapping from fitted batch label to stored anchor embeddings,
+        propagated displacements, and corrected embeddings used for
+        projection.
+    key_added_
+        Output key used by :meth:`correct` and :meth:`project` when writing
+        corrected embeddings into ``adata.obsm``.
+    n_corrections_
+        Number of correction rounds estimated during the most recent fit.
     """
 
     def __init__(
@@ -169,71 +62,111 @@ class MNNCorrector:
         k_mnn: int = 10,
         k_propagate: int = 20,
         weighting_scheme: WeightingScheme = "jaccard_square",
-        store_for_projection: bool = False,
+        store_for_projection: bool = True,
         nogpu: bool = False,
         verbose: bool = True,
     ) -> None:
+        """Initialize a stateful MNN corrector."""
         self.k_mnn = k_mnn
         self.k_propagate = k_propagate
         self.weighting_scheme = weighting_scheme
+        self._store_for_projection_requested = store_for_projection
         self.store_for_projection = store_for_projection
         self.nogpu = nogpu
         self.verbose = verbose
 
-        # ── State from the most recently called fit() ─────────────────────── #
         self.emb_query_with_mnn_: Optional[np.ndarray] = None
         self.avg_disp_: Optional[np.ndarray] = None
         self.obs_names_with_mnn_: Optional[pd.Index] = None
         self.n_mnn_pairs_: int = 0
         self.n_query_with_mnn_: int = 0
 
-        # ── Per-batch projection store ─────────────────────────────────────── #
-        # Only populated when store_for_projection=True.
-        # projection_data_[batch_label] = {
-        #     "emb_anchor"      : (n_anchors, d)  — MNN-anchor cell embeddings
-        #     "disp_anchor"     : (n_anchors, d)  — raw per-anchor displacement
-        #     "emb_all"         : (n_all,     d)  — all query cell embeddings
-        #     "disp_propagated" : (n_all,     d)  — smoothed displacement
-        # }
-        self.projection_data_: Dict[str, Dict[str, np.ndarray]] = {}
+        self.projection_data_: Dict[str, Dict[str, Any]] = {}
+        self.n_corrections_: int = 0
+
+        self.batch_key_: Optional[str] = None
+        self.batch_order_: Optional[List[str]] = None
+        self.reference_: Optional[str] = None
+        self.use_rep_: Optional[str] = None
+        self.key_added_: Optional[str] = None
+        self.fitted_obs_names_: Optional[pd.Index] = None
+        self.fitted_batches_: List[str] = []
+
+        self._corrected_embeddings_: Optional[np.ndarray] = None
+        self._source_embeddings_: Optional[np.ndarray] = None
 
     @property
     def is_fitted(self) -> bool:
-        """``True`` after :meth:`fit` has been called at least once."""
-        return self.emb_query_with_mnn_ is not None
+        """Whether :meth:`fit` has estimated correction state.
 
-    def fit(
+        Returns
+        -------
+        bool
+            ``True`` once correction and projection state are available.
+        """
+        return self._corrected_embeddings_ is not None
+
+    def _reset_fit_state(self) -> None:
+        """Clear all state associated with a previous fit."""
+        self.emb_query_with_mnn_ = None
+        self.avg_disp_ = None
+        self.obs_names_with_mnn_ = None
+        self.n_mnn_pairs_ = 0
+        self.n_query_with_mnn_ = 0
+        self.projection_data_ = {}
+        self.n_corrections_ = 0
+        self.batch_key_ = None
+        self.batch_order_ = None
+        self.reference_ = None
+        self.use_rep_ = None
+        self.key_added_ = None
+        self.fitted_obs_names_ = None
+        self.fitted_batches_ = []
+        self._corrected_embeddings_ = None
+        self._source_embeddings_ = None
+
+    def _set_last_batch_state(self, batch_model: Dict[str, Any]) -> None:
+        """Expose the most recently fitted batch model through legacy attributes.
+
+        Parameters
+        ----------
+        batch_model
+            Internal batch model dictionary produced by
+            :meth:`_estimate_batch_model`.
+        """
+        self.emb_query_with_mnn_ = np.asarray(batch_model["emb_anchor"])
+        self.avg_disp_ = np.asarray(batch_model["disp_anchor"])
+        self.obs_names_with_mnn_ = pd.Index(batch_model["obs_names_anchor"])
+        self.n_mnn_pairs_ = int(batch_model["n_mnn_pairs"])
+        self.n_query_with_mnn_ = int(batch_model["n_query_with_mnn"])
+
+    def _estimate_batch_model(
         self,
         emb_ref: np.ndarray,
         emb_query: np.ndarray,
-        obs_names_query: Optional[pd.Index] = None,
-        batch_label: str = "default",
-    ) -> "MNNCorrector":
-        """Estimate per-cell correction displacements from MNN pairs.
-
-        When ``store_for_projection=True`` this also propagates the
-        per-anchor displacement to *all* query cells and saves both the raw
-        and propagated results in :attr:`projection_data_` under *batch_label*.
+        obs_names_query: pd.Index,
+        batch_label: str,
+    ) -> Dict[str, Any]:
+        """Estimate correction state for a single query batch against a reference.
 
         Parameters
         ----------
         emb_ref
-            Reference embeddings, shape ``(n_ref, d)``.
+            Corrected embedding for the current reference cells.
         emb_query
-            Query embeddings, shape ``(n_query, d)``.
+            Embedding for the current query batch.
         obs_names_query
-            Observation names for query cells.  Defaults to ``RangeIndex``.
+            Observation names aligned to ``emb_query``.
         batch_label
-            Identifier for this query batch.  Used as the key in
-            :attr:`projection_data_` when ``store_for_projection=True``.
+            Label used to store this fitted batch model.
 
         Returns
         -------
-        self
+        dict
+            Stored batch model containing anchor embeddings, displacement
+            vectors, propagated correction for all query cells, and summary
+            counts.
         """
-        if obs_names_query is None:
-            obs_names_query = pd.RangeIndex(emb_query.shape[0])
-
         if self.verbose:
             print(
                 f"[MNNCorrector.fit] Finding MNN pairs (k_mnn={self.k_mnn}) "
@@ -243,28 +176,31 @@ class MNNCorrector:
             )
 
         nn_q2r = wknn.build_nn(
-            ref=emb_ref, query=emb_query, k=self.k_mnn,
-            weight="unweighted", nogpu=self.nogpu, verbose=self.verbose,
+            ref=emb_ref,
+            query=emb_query,
+            k=self.k_mnn,
+            weight="unweighted",
+            nogpu=self.nogpu,
+            verbose=self.verbose,
         )
         nn_r2q = wknn.build_nn(
-            ref=emb_query, query=emb_ref, k=self.k_mnn,
-            weight="unweighted", nogpu=self.nogpu, verbose=self.verbose,
+            ref=emb_query,
+            query=emb_ref,
+            k=self.k_mnn,
+            weight="unweighted",
+            nogpu=self.nogpu,
+            verbose=self.verbose,
         )
 
-        # Mutual: both cells appear in each other's k-NN list
-        mnn_matrix = (nn_q2r + nn_r2q.T) == 2  # (n_query, n_ref)
+        mnn_matrix = (nn_q2r + nn_r2q.T) == 2
         idx_i, idx_j = mnn_matrix.nonzero()
-
         if len(idx_i) == 0:
             raise ValueError(
-                f"No MNN pairs found with k_mnn={self.k_mnn}. "
-                "Try increasing k_mnn or verifying that the two batches share "
-                "a common signal in the chosen representation."
+                f"No MNN pairs found with k_mnn={self.k_mnn} for batch '{batch_label}'. "
+                "Try increasing k_mnn or verifying that the batches share a "
+                "common signal in the chosen representation."
             )
 
-        self.n_mnn_pairs_ = len(idx_i)
-
-        # Displacement direction: ref − query  (positive = toward reference)
         displacement_pairs = emb_ref[idx_j] - emb_query[idx_i]
         avg_disp_df = (
             pd.concat(
@@ -274,136 +210,182 @@ class MNNCorrector:
             .groupby("i")
             .mean()
         )
-        # groupby sorts by key ⟹ index is sorted unique values from idx_i
         unique_idx_i = avg_disp_df.index.to_numpy()
         avg_disp_df.index = obs_names_query[unique_idx_i]
 
-        self.obs_names_with_mnn_ = avg_disp_df.index
-        self.emb_query_with_mnn_ = emb_query[unique_idx_i]
-        self.avg_disp_ = avg_disp_df.values
-        self.n_query_with_mnn_ = len(unique_idx_i)
-
-        if self.verbose:
-            print(
-                f"[MNNCorrector.fit] Found {self.n_mnn_pairs_:,} MNN pairs "
-                f"covering {self.n_query_with_mnn_:,} query anchor cells."
-            )
-
-        # ── Projection store ───────────────────────────────────────────────── #
-        if self.store_for_projection:
-            if self.verbose:
-                print(
-                    f"[MNNCorrector.fit] Computing propagated displacement for all "
-                    f"{emb_query.shape[0]:,} query cells and storing under "
-                    f"batch='{batch_label}'..."
-                )
-            disp_propagated = _propagate_weighted(
+        emb_anchor = emb_query[unique_idx_i]
+        disp_anchor = avg_disp_df.to_numpy()
+        disp_propagated = np.asarray(
+            propagate_weighted(
                 emb_new=emb_query,
-                ref_emb=self.emb_query_with_mnn_,
-                ref_disp=self.avg_disp_,
+                ref_emb=emb_anchor,
+                ref_disp=disp_anchor,
                 k=self.k_propagate,
                 weighting_scheme=self.weighting_scheme,
                 nogpu=self.nogpu,
                 verbose=self.verbose,
             )
-            self.projection_data_[batch_label] = {
-                "emb_anchor":      self.emb_query_with_mnn_.copy(),
-                "disp_anchor":     self.avg_disp_.copy(),
-                "emb_all":         emb_query.copy(),
-                "disp_propagated": disp_propagated,
-            }
+        )
 
-        return self
+        if self.verbose:
+            print(
+                f"[MNNCorrector.fit] Found {len(idx_i):,} MNN pairs covering "
+                f"{len(unique_idx_i):,} query anchor cells for batch '{batch_label}'."
+            )
 
-    def transform(
+        return {
+            "batch_label": batch_label,
+            "obs_names_all": pd.Index(obs_names_query),
+            "obs_names_anchor": avg_disp_df.index.copy(),
+            "emb_anchor": emb_anchor.copy(),
+            "disp_anchor": disp_anchor.copy(),
+            "emb_all": emb_query.copy(),
+            "disp_propagated": disp_propagated,
+            "corrected_all": emb_query + disp_propagated,
+            "n_mnn_pairs": len(idx_i),
+            "n_query_with_mnn": len(unique_idx_i),
+        }
+
+    def _resolve_fit_representation(
+        self,
+        adata: AnnData,
+        use_rep: Optional[str],
+        n_pca_components: int,
+    ) -> Tuple[np.ndarray, str]:
+        """Resolve the representation used for fitting.
+
+        Parameters
+        ----------
+        adata
+            Training AnnData object.
+        use_rep
+            Key in ``adata.obsm`` to use as the source embedding, or ``None``
+            to fit a PCA model on ``adata.X`` with :func:`scanpy.pp.pca` for
+            the current correction run only.
+        n_pca_components
+            Number of PCA components when ``use_rep=None``.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, str]
+            Dense embedding matrix and the default output key for corrected
+            embeddings.
+        """
+        if use_rep is None:
+            if adata.X is None:
+                raise ValueError("use_rep=None requires adata.X to be non-None.")
+
+            if self.verbose:
+                print(
+                    f"[MNNCorrector.fit] use_rep=None -- running scanpy.pp.pca "
+                    f"(n_components={n_pca_components}) across all {adata.n_obs:,} cells..."
+                )
+
+            n_comp = min(n_pca_components, min(adata.n_obs, adata.n_vars) - 1)
+            if n_comp < 1:
+                raise ValueError("PCA requires at least two cells and one feature.")
+
+            pca_adata = AnnData(X=adata.X.copy())
+            sc.pp.pca(pca_adata, n_comps=n_comp, dtype="float64")
+            embeddings = np.asarray(pca_adata.obsm["X_pca"])
+            return embeddings, "X_pca_mnn_corrected"
+
+        if use_rep not in adata.obsm:
+            raise KeyError(f"use_rep '{use_rep}' not found in adata.obsm.")
+
+        return np.asarray(adata.obsm[use_rep]), f"{use_rep}_mnn_corrected"
+
+    def _resolve_project_representation(
+        self,
+        adata: AnnData,
+        use_rep: Optional[str],
+    ) -> np.ndarray:
+        """Resolve the source representation used for projection or validation.
+
+        Parameters
+        ----------
+        adata
+            AnnData object whose cells should be projected or validated.
+        use_rep
+            Optional representation override. This must match the fitted
+            representation when the corrector was not trained from ``adata.X``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Dense embedding matrix used for projection.
+        """
+        if self.use_rep_ is None:
+            raise ValueError(
+                "Projection is unavailable when fit() was run with use_rep=None. "
+                "Provide a reusable representation in adata.obsm to enable project()."
+            )
+
+        rep_key = use_rep or self.use_rep_
+        if rep_key != self.use_rep_:
+            raise ValueError(
+                f"project() expected use_rep='{self.use_rep_}', got '{rep_key}'."
+            )
+        if rep_key not in adata.obsm:
+            raise KeyError(f"use_rep '{rep_key}' not found in adata.obsm.")
+        return np.asarray(adata.obsm[rep_key])
+
+    def _project_embeddings(
         self,
         emb_new: np.ndarray,
-        batch: Optional[str] = None,
-        use_propagated: bool = False,
+        batch_label: str,
+        use_propagated: bool,
     ) -> np.ndarray:
-        """Propagate correction displacement to *emb_new* and return corrected embeddings.
-
-        **Default behaviour** (``batch=None``):
-            KNN is built from *emb_new* to the MNN-anchor cells of the most
-            recently fitted batch; their raw ``avg_disp_`` vectors are
-            propagated to every new cell.
-
-        **Batch-specific projection** (``batch=<label>``, requires
-        ``store_for_projection=True``):
-            KNN is built from *emb_new* to the stored cells of the named batch.
-            Two reference sets are supported:
-
-            * ``use_propagated=False`` (default): anchor cells +
-              ``disp_anchor`` — tighter reference, only MNN cells.
-            * ``use_propagated=True``: all known query cells +
-              ``disp_propagated`` — denser reference, smoother result.
+        """Project stored displacement vectors onto a raw embedding matrix.
 
         Parameters
         ----------
         emb_new
-            Embeddings to correct, shape ``(n_new, d)``.
-        batch
-            Batch label to look up in :attr:`projection_data_`.  ``None``
-            falls back to the default anchor-based propagation.
+            Embeddings to correct.
+        batch_label
+            Previously fitted batch label whose projection model should be used.
         use_propagated
-            When ``batch`` is given: if ``True`` use the full set of known
-            query cells and their propagated displacement as the KNN reference;
-            if ``False`` use only MNN-anchor cells and their raw displacement.
+            If ``True``, use propagated displacement from all fitted cells in
+            the batch. If ``False``, use only anchor-cell displacement.
 
         Returns
         -------
-        np.ndarray
-            Corrected embeddings, shape ``(n_new, d)``.
-
-        Raises
-        ------
-        RuntimeError
-            If called before :meth:`fit`.
-        ValueError
-            If ``batch`` is given but ``store_for_projection=False``.
-        KeyError
-            If ``batch`` is not found in :attr:`projection_data_`.
+        numpy.ndarray
+            Corrected embedding matrix.
         """
         if not self.is_fitted:
             raise RuntimeError(
-                "MNNCorrector must be fitted before calling transform(). "
-                "Call fit() or fit_transform() first."
+                "MNNCorrector must be fitted before calling project(). Call fit() first."
+            )
+        if not self.store_for_projection:
+            raise ValueError(
+                "Projection is unavailable for this fitted corrector. Fit with a reusable "
+                "representation in adata.obsm and store_for_projection=True."
+            )
+        if batch_label not in self.projection_data_:
+            raise KeyError(
+                f"No projection data stored for batch '{batch_label}'. "
+                f"Available batches: {sorted(self.projection_data_.keys())}."
             )
 
-        if batch is not None:
-            if not self.store_for_projection:
-                raise ValueError(
-                    "Batch-specific projection requires store_for_projection=True. "
-                    "Re-create the corrector with store_for_projection=True and re-fit."
-                )
-            if batch not in self.projection_data_:
-                raise KeyError(
-                    f"No projection data stored for batch '{batch}'. "
-                    f"Available batches: {sorted(self.projection_data_.keys())}."
-                )
-            d = self.projection_data_[batch]
-            if use_propagated:
-                ref_emb  = d["emb_all"]
-                ref_disp = d["disp_propagated"]
-                ref_desc = f"all cells of batch='{batch}' (propagated displacement)"
-            else:
-                ref_emb  = d["emb_anchor"]
-                ref_disp = d["disp_anchor"]
-                ref_desc = f"anchor cells of batch='{batch}' (raw displacement)"
+        batch_model = self.projection_data_[batch_label]
+        if use_propagated:
+            ref_emb = np.asarray(batch_model["emb_all"])
+            ref_disp = np.asarray(batch_model["disp_propagated"])
+            ref_desc = f"all fitted cells from batch='{batch_label}'"
         else:
-            ref_emb  = self.emb_query_with_mnn_
-            ref_disp = self.avg_disp_
-            ref_desc = "anchor cells of most recently fitted batch"
+            ref_emb = np.asarray(batch_model["emb_anchor"])
+            ref_disp = np.asarray(batch_model["disp_anchor"])
+            ref_desc = f"anchor cells from batch='{batch_label}'"
 
         if self.verbose:
             print(
-                f"[MNNCorrector.transform] Projecting {emb_new.shape[0]:,} new cells "
-                f"using {ref_desc} "
+                f"[MNNCorrector.project] Projecting {emb_new.shape[0]:,} cells using {ref_desc} "
                 f"(k_propagate={min(self.k_propagate, ref_emb.shape[0])}, "
                 f"weighting='{self.weighting_scheme}')..."
             )
 
-        displacement = _propagate_weighted(
+        displacement = propagate_weighted(
             emb_new=emb_new,
             ref_emb=ref_emb,
             ref_disp=ref_disp,
@@ -412,30 +394,318 @@ class MNNCorrector:
             nogpu=self.nogpu,
             verbose=self.verbose,
         )
-        return emb_new + displacement
+        return emb_new + np.asarray(displacement)
 
-    def fit_transform(
+    def fit(
         self,
-        emb_ref: np.ndarray,
-        emb_query: np.ndarray,
-        obs_names_query: Optional[pd.Index] = None,
-        batch_label: str = "default",
-    ) -> np.ndarray:
-        """Fit the model and return corrected query embeddings.
+        adata: AnnData,
+        batch_key: str,
+        batch_order: Optional[List[str]] = None,
+        reference: Optional[str] = None,
+        use_rep: Optional[str] = None,
+        n_pca_components: int = 50,
+        key_added: Optional[str] = None,
+    ) -> "MNNCorrector":
+        """Estimate and store per-batch displacement models from an AnnData object.
 
-        When ``store_for_projection=True`` this is equivalent to calling
-        :meth:`fit` followed by :meth:`transform` with ``batch=batch_label``
-        and ``use_propagated=True``, ensuring consistent results.
+        Parameters
+        ----------
+        adata
+            AnnData object containing all batches involved in model fitting.
+        batch_key
+            Column in ``adata.obs`` identifying batch membership.
+        batch_order
+            Optional sequential correction order. The first batch is treated as
+            the initial reference and each subsequent batch is corrected in
+            turn against the growing reference.
+        reference
+            Optional fixed reference batch. When provided, every other batch is
+            corrected independently against this batch.
+        use_rep
+            Key in ``adata.obsm`` containing the latent representation to
+            correct. If ``None``, PCA is fit on ``adata.X`` for the current
+            correction only and future projection is disabled.
+        n_pca_components
+            Number of PCA components when ``use_rep=None``.
+        key_added
+            Optional output key for corrected embeddings written by
+            :meth:`correct` and :meth:`project`.
+
+        Returns
+        -------
+        MNNCorrector
+            The fitted corrector instance.
+
+        Raises
+        ------
+        KeyError
+            If ``batch_key`` or ``use_rep`` cannot be resolved.
+        ValueError
+            If both ``batch_order`` and ``reference`` are provided or if the
+            requested batch labels are inconsistent with the input data.
         """
-        self.fit(emb_ref, emb_query, obs_names_query, batch_label)
-        if self.store_for_projection:
-            return self.transform(emb_query, batch=batch_label, use_propagated=True)
-        return self.transform(emb_query)
+        if batch_key not in adata.obs.columns:
+            raise KeyError(f"batch_key '{batch_key}' not found in adata.obs.")
+        if reference is not None and batch_order is not None:
+            raise ValueError(
+                "Provide either 'reference' (fixed-reference mode) or 'batch_order' "
+                "(sequential mode), not both."
+            )
 
+        observed = sorted(adata.obs[batch_key].unique().tolist())
+        if reference is not None and reference not in observed:
+            raise ValueError(
+                f"reference '{reference}' not found in adata.obs['{batch_key}']. "
+                f"Available: {observed}."
+            )
+        if batch_order is not None:
+            missing = set(observed) - set(batch_order)
+            extra = set(batch_order) - set(observed)
+            if missing:
+                raise ValueError(
+                    f"batch_order is missing labels present in the data: {sorted(missing)}."
+                )
+            if extra:
+                raise ValueError(
+                    f"batch_order contains labels not found in the data: {sorted(extra)}."
+                )
 
-# ──────────────────────────────────────────────────────────────────────────── #
-# mnn_correct — pairwise AnnData correction
-# ──────────────────────────────────────────────────────────────────────────── #
+        self._reset_fit_state()
+        source_embeddings, default_key_added = self._resolve_fit_representation(
+            adata, use_rep, n_pca_components
+        )
+        self.store_for_projection = self._store_for_projection_requested
+        if use_rep is None:
+            self.store_for_projection = False
+            if self.verbose and self._store_for_projection_requested:
+                print(
+                    "[MNNCorrector.fit] use_rep=None disables future projection; "
+                    "store_for_projection has been forced to False for this fit."
+                )
+        corrected_embeddings = source_embeddings.copy()
+        batch_values = adata.obs[batch_key]
+
+        self.batch_key_ = batch_key
+        self.reference_ = reference
+        self.use_rep_ = use_rep
+        self.key_added_ = key_added or default_key_added
+        self.fitted_obs_names_ = adata.obs_names.copy()
+
+        if reference is None:
+            order = batch_order if batch_order is not None else observed
+            self.batch_order_ = list(order)
+            if self.verbose:
+                print(f"[MNNCorrector.fit] Sequential mode -- batch order: {order}")
+
+            for index in range(1, len(order)):
+                query_label = order[index]
+                ref_labels = order[:index]
+                ref_mask = batch_values.isin(ref_labels).to_numpy()
+                query_mask = (batch_values == query_label).to_numpy()
+
+                if self.verbose:
+                    print(
+                        f"[MNNCorrector.fit] Round {index}/{len(order) - 1}: "
+                        f"ref={ref_labels} ({int(ref_mask.sum()):,} cells) -> "
+                        f"query='{query_label}' ({int(query_mask.sum()):,} cells)"
+                    )
+
+                batch_model = self._estimate_batch_model(
+                    emb_ref=corrected_embeddings[ref_mask],
+                    emb_query=corrected_embeddings[query_mask],
+                    obs_names_query=adata.obs_names[query_mask],
+                    batch_label=query_label,
+                )
+                corrected_embeddings[query_mask] = np.asarray(batch_model["corrected_all"])
+                if self.store_for_projection:
+                    self.projection_data_[query_label] = batch_model
+                self.fitted_batches_.append(query_label)
+                self._set_last_batch_state(batch_model)
+        else:
+            ref_mask = (batch_values == reference).to_numpy()
+            query_labels = [label for label in observed if label != reference]
+            if self.verbose:
+                print(
+                    f"[MNNCorrector.fit] Fixed-reference mode -- reference='{reference}', "
+                    f"query batches: {query_labels}"
+                )
+
+            for index, query_label in enumerate(query_labels, start=1):
+                query_mask = (batch_values == query_label).to_numpy()
+
+                if self.verbose:
+                    print(
+                        f"[MNNCorrector.fit] Round {index}/{len(query_labels)}: "
+                        f"ref='{reference}' ({int(ref_mask.sum()):,} cells) -> "
+                        f"query='{query_label}' ({int(query_mask.sum()):,} cells)"
+                    )
+
+                batch_model = self._estimate_batch_model(
+                    emb_ref=corrected_embeddings[ref_mask],
+                    emb_query=corrected_embeddings[query_mask],
+                    obs_names_query=adata.obs_names[query_mask],
+                    batch_label=query_label,
+                )
+                corrected_embeddings[query_mask] = np.asarray(batch_model["corrected_all"])
+                if self.store_for_projection:
+                    self.projection_data_[query_label] = batch_model
+                self.fitted_batches_.append(query_label)
+                self._set_last_batch_state(batch_model)
+
+        self._corrected_embeddings_ = corrected_embeddings
+        self._source_embeddings_ = source_embeddings.copy()
+        self.n_corrections_ = len(self.fitted_batches_)
+
+        if self.verbose:
+            print(
+                f"[MNNCorrector.fit] Stored displacement models for "
+                f"{self.n_corrections_:,} batch correction round(s)."
+            )
+
+        return self
+
+    def correct(
+        self,
+        adata: AnnData,
+        key_added: Optional[str] = None,
+        copy: bool = False,
+    ) -> Optional[AnnData]:
+        """Apply the fitted correction to the AnnData used during :meth:`fit`.
+
+        Parameters
+        ----------
+        adata
+            The same AnnData object, or a reordered view containing the same
+            cells and source representation, that was used during fitting.
+        key_added
+            Optional override for the output key in ``adata.obsm``.
+        copy
+            If ``True``, return a corrected copy instead of modifying ``adata``
+            in place.
+
+        Returns
+        -------
+        AnnData or None
+            Corrected copy when ``copy=True``; otherwise ``None``.
+
+        Raises
+        ------
+        RuntimeError
+            If the corrector has not been fitted.
+        ValueError
+            If ``adata`` does not match the cells and representation used
+            during fitting.
+        """
+        if (
+            not self.is_fitted
+            or self.fitted_obs_names_ is None
+            or self._corrected_embeddings_ is None
+            or self._source_embeddings_ is None
+        ):
+            raise RuntimeError(
+                "MNNCorrector must be fitted before calling correct(). Call fit() first."
+            )
+
+        indexer = self.fitted_obs_names_.get_indexer(adata.obs_names)
+        if len(adata.obs_names) != len(self.fitted_obs_names_) or np.any(indexer < 0):
+            raise ValueError(
+                "correct() expects the same cells used during fit(). Use project() for new cells."
+            )
+
+        if self.use_rep_ is not None:
+            current_source = self._resolve_project_representation(adata, self.use_rep_)
+            if not np.allclose(current_source, self._source_embeddings_[indexer]):
+                raise ValueError(
+                    "correct() expects the same cells and source representation used during fit(). "
+                    "Use project() for new cells."
+                )
+
+        target = adata.copy() if copy else adata
+        target_key = key_added or self.key_added_
+        if target_key is None:
+            raise RuntimeError("No output key is available. Re-fit the corrector first.")
+
+        target.obsm[target_key] = self._corrected_embeddings_[indexer].copy()
+
+        if self.verbose:
+            print(
+                f"[MNNCorrector.correct] Corrected embedding stored in adata.obsm['{target_key}']."
+            )
+
+        return target if copy else None
+
+    def project(
+        self,
+        adata: AnnData,
+        batch_label: str,
+        use_rep: Optional[str] = None,
+        key_added: Optional[str] = None,
+        use_propagated: bool = True,
+        copy: bool = False,
+    ) -> Optional[AnnData]:
+        """Project a fitted batch displacement model onto new cells.
+
+        Parameters
+        ----------
+        adata
+            AnnData containing new cells from a previously fitted batch.
+        batch_label
+            Batch label whose fitted displacement model should be reused.
+        use_rep
+            Optional representation key. This must match the representation
+            used during fitting.
+        key_added
+            Optional override for the output key in ``adata.obsm``.
+        use_propagated
+            If ``True``, project from all fitted cells in the batch using their
+            propagated displacements. If ``False``, use only MNN anchor cells.
+        copy
+            If ``True``, return a corrected copy instead of modifying ``adata``
+            in place.
+
+        Returns
+        -------
+        AnnData or None
+            Corrected copy when ``copy=True``; otherwise ``None``.
+        """
+        emb_new = self._resolve_project_representation(adata, use_rep)
+        corrected = self._project_embeddings(emb_new, batch_label, use_propagated)
+
+        target = adata.copy() if copy else adata
+        target_key = key_added or self.key_added_
+        if target_key is None:
+            raise RuntimeError("No output key is available. Re-fit the corrector first.")
+
+        target.obsm[target_key] = corrected
+        return target if copy else None
+
+    def transform(
+        self,
+        emb_new: np.ndarray,
+        batch: str,
+        use_propagated: bool = True,
+    ) -> np.ndarray:
+        """Project raw embeddings using a fitted batch model.
+
+        This low-level helper is retained for backwards compatibility. New
+        AnnData-based workflows should prefer :meth:`project`.
+
+        Parameters
+        ----------
+        emb_new
+            Embeddings to correct.
+        batch
+            Fitted batch label whose displacement model should be reused.
+        use_propagated
+            Whether to project from all fitted cells or anchor cells only.
+
+        Returns
+        -------
+        numpy.ndarray
+            Corrected embedding matrix.
+        """
+        return self._project_embeddings(emb_new, batch, use_propagated)
+
 
 def mnn_correct(
     adata_ref: AnnData,
@@ -445,7 +715,7 @@ def mnn_correct(
     k_mnn: int = 10,
     k_propagate: int = 20,
     weighting_scheme: WeightingScheme = "jaccard_square",
-    store_for_projection: bool = False,
+    store_for_projection: bool = True,
     batch_label: Optional[str] = None,
     key_added: Optional[str] = None,
     nogpu: bool = False,
@@ -453,98 +723,53 @@ def mnn_correct(
 ) -> MNNCorrector:
     """Correct batch effects between two AnnData objects using MNN.
 
-    The **reference** batch is never modified.  The corrected query embedding
-    is written into ``adata_query.obsm[key_added]`` in-place.
-
-    If ``use_rep`` is ``None`` the function falls back to computing a joint PCA
-    on the concatenated raw features (``.X``) of both objects and using that as
-    the matched latent representation.
-
     Parameters
     ----------
     adata_ref
-        Reference (anchor) AnnData — cells are not moved.
+        Reference AnnData. Its embeddings are not modified.
     adata_query
-        Query AnnData — cells will be corrected in-place.
+        Query AnnData. The corrected embedding is written into
+        ``adata_query.obsm``.
     use_rep
-        Key present in both ``adata_ref.obsm`` and ``adata_query.obsm`` for the
-        shared latent representation.  Pass ``None`` to trigger joint PCA on
-        ``.X`` (requires ``sklearn``).
+        Key in ``.obsm`` containing the latent representation to correct. If
+        ``None``, PCA is fit on the concatenated ``.X`` matrices.
     n_pca_components
         Number of PCA components when ``use_rep=None``.
     k_mnn
-        Number of nearest neighbours for MNN detection.
+        Number of neighbours used for MNN detection.
     k_propagate
-        Number of nearest neighbours for displacement propagation.
+        Number of neighbours used for displacement propagation.
     weighting_scheme
-        Edge-weighting scheme for the propagation graph.
+        Propagation weighting scheme.
     store_for_projection
-        If ``True``, the returned :class:`MNNCorrector` stores the per-anchor
-        raw displacement and the propagated displacement for *all* query cells,
-        enabling later projection of new (unseen) cells via
-        :meth:`~MNNCorrector.transform`.
+        Whether to retain projection state in the returned corrector. This is
+        forced to ``False`` when ``use_rep=None``.
     batch_label
-        Key under which projection data is stored inside the corrector when
-        ``store_for_projection=True``.  Defaults to ``"default"``.
+        Label used to store the query batch model for later projection.
     key_added
-        Key under which the corrected embedding is stored in
-        ``adata_query.obsm``.  Defaults to ``"{use_rep}_mnn_corrected"``
-        (or ``"X_pca_mnn_corrected"`` when ``use_rep=None``).
+        Optional output key written into ``adata_query.obsm``.
     nogpu
-        Force CPU-based neighbour search.
+        If ``True``, force CPU-based neighbour search.
     verbose
-        Print progress messages.
+        If ``True``, print progress messages.
 
     Returns
     -------
     MNNCorrector
-        A fitted corrector.  When ``store_for_projection=True`` its
-        :meth:`~MNNCorrector.transform` method can project new query cells
-        using the saved displacement model.
-
-    Raises
-    ------
-    KeyError
-        If ``use_rep`` is not found in ``adata_ref.obsm`` or ``adata_query.obsm``.
-    ValueError
-        If no MNN pairs can be identified.
-
-    Examples
-    --------
-    >>> corrector = mnn_correct(adata_ref, adata_query, use_rep="X_scVI",
-    ...                         store_for_projection=True, batch_label="query")
-    >>> adata_query.obsm["X_scVI_mnn_corrected"]  # corrected embedding
-    >>> # Project new cells from the same batch:
-    >>> emb_proj = corrector.transform(emb_new, batch="query", use_propagated=True)
+        Fitted corrector. Projection is available only when a reusable
+        representation was supplied.
     """
-    # ── Resolve embeddings ─────────────────────────────────────────────── #
-    if use_rep is None:
-        if adata_ref.X is None or adata_query.X is None:
-            raise ValueError(
-                "use_rep=None requires both adata_ref.X and adata_query.X to be "
-                "non-None.  Provide a pre-computed representation via use_rep."
-            )
-        emb_ref, emb_query = _joint_pca(
-            adata_ref.X, adata_query.X,
-            n_components=n_pca_components, verbose=verbose,
-        )
-        _key = key_added or "X_pca_mnn_corrected"
-    else:
-        if use_rep not in adata_ref.obsm:
-            raise KeyError(f"use_rep '{use_rep}' not found in adata_ref.obsm.")
-        if use_rep not in adata_query.obsm:
-            raise KeyError(f"use_rep '{use_rep}' not found in adata_query.obsm.")
-        emb_ref = np.asarray(adata_ref.obsm[use_rep])
-        emb_query = np.asarray(adata_query.obsm[use_rep])
-        _key = key_added or f"{use_rep}_mnn_corrected"
+    query_label = batch_label or "default"
+    batch_key = "_mnn_correct_batch"
+    reference_label = "_mnn_correct_reference"
 
-    if verbose:
-        print(
-            f"[mnn_correct] {adata_query.n_obs:,} query cells ← "
-            f"{adata_ref.n_obs:,} reference cells  →  '{_key}'"
-        )
+    adata_pair = concat(
+        [adata_ref.copy(), adata_query.copy()],
+        label=batch_key,
+        keys=[reference_label, query_label],
+        index_unique=None,
+    )
 
-    # ── Fit and apply correction ───────────────────────────────────────── #
     corrector = MNNCorrector(
         k_mnn=k_mnn,
         k_propagate=k_propagate,
@@ -553,26 +778,26 @@ def mnn_correct(
         nogpu=nogpu,
         verbose=verbose,
     )
-    _batch_label = batch_label or "default"
-    emb_corrected = corrector.fit_transform(
-        emb_ref, emb_query,
-        obs_names_query=adata_query.obs_names,
-        batch_label=_batch_label,
+    corrector.fit(
+        adata_pair,
+        batch_key=batch_key,
+        reference=reference_label,
+        use_rep=use_rep,
+        n_pca_components=n_pca_components,
+        key_added=key_added,
     )
-    adata_query.obsm[_key] = emb_corrected
+    corrector.correct(adata_pair)
 
-    if verbose:
-        print(
-            f"[mnn_correct] Done.  Corrected embedding stored in "
-            f"adata_query.obsm['{_key}']."
-        )
+    target_key = corrector.key_added_
+    if target_key is None:
+        raise RuntimeError("No output key is available after fitting the corrector.")
 
+    query_names = adata_query.obs_names
+    query_mask = adata_pair.obs_names.isin(query_names)
+    corrected_query = np.asarray(adata_pair.obsm[target_key])[query_mask]
+    adata_query.obsm[target_key] = corrected_query.copy()
     return corrector
 
-
-# ──────────────────────────────────────────────────────────────────────────── #
-# mnn_correct_adata — multi-batch correction on a single AnnData
-# ──────────────────────────────────────────────────────────────────────────── #
 
 def mnn_correct_adata(
     adata: AnnData,
@@ -584,242 +809,70 @@ def mnn_correct_adata(
     k_mnn: int = 10,
     k_propagate: int = 20,
     weighting_scheme: WeightingScheme = "jaccard_square",
-    store_for_projection: bool = False,
+    store_for_projection: bool = True,
     key_added: Optional[str] = None,
     copy: bool = False,
     nogpu: bool = False,
     verbose: bool = True,
-) -> Tuple[Optional[AnnData], List[MNNCorrector]]:
-    """Multi-batch MNN correction on a single AnnData.
-
-    Two correction strategies are supported:
-
-    **Sequential** (default, or when *batch_order* is given):
-        Batches are aligned one at a time.  The first batch in *batch_order*
-        is the initial reference; each subsequent batch is the query.  After
-        correction the newly corrected batch is merged into the growing
-        reference for the next round.  This propagates corrections across
-        all batches in a single pass.
-
-    **Fixed-reference** (when *reference* is given):
-        Every non-reference batch is independently corrected against the
-        single reference batch.  The reference is never altered.  Suitable
-        when one batch serves as a canonical atlas.
+) -> Tuple[Optional[AnnData], MNNCorrector]:
+    """Fit and apply MNN batch correction on a single AnnData object.
 
     Parameters
     ----------
     adata
-        Annotated data matrix containing all batches.
+        AnnData containing all batches to correct.
     batch_key
-        Column in ``adata.obs`` whose values identify batch membership.
+        Column in ``adata.obs`` identifying batch membership.
     batch_order
-        Ordered list of all batch labels for *sequential* correction.  Ignored
-        when ``reference`` is provided.  If ``None`` and ``reference`` is also
-        ``None``, batches are sorted alphabetically.
+        Optional sequential correction order.
     reference
-        Label of the fixed reference batch.  All other batches are
-        independently aligned to it.  Mutually exclusive with *batch_order*.
+        Optional fixed reference batch.
     use_rep
-        Key in ``adata.obsm`` for the shared latent representation.  Pass
-        ``None`` to run a joint PCA across all cells using ``.X``.
+        Key in ``adata.obsm`` containing the latent representation to correct.
+        If ``None``, PCA is fit on ``adata.X`` for the current correction only
+        and future projection is disabled.
     n_pca_components
-        PCA dimensionality when ``use_rep=None``.
+        Number of PCA components when ``use_rep=None``.
     k_mnn
-        Number of nearest neighbours for MNN detection.
+        Number of neighbours used for MNN detection.
     k_propagate
-        Number of nearest neighbours for displacement propagation.
+        Number of neighbours used for displacement propagation.
     weighting_scheme
-        Edge-weighting for the propagation graph.
+        Propagation weighting scheme.
     store_for_projection
-        If ``True``, every per-batch :class:`MNNCorrector` stores projection
-        data (anchor displacements + propagated displacements) keyed by the
-        query batch label, enabling later projection of new cells via
-        :meth:`~MNNCorrector.transform`.
+        Whether to retain projection state in the returned corrector. This is
+        forced to ``False`` when ``use_rep=None``.
     key_added
-        Key under which corrected embeddings are stored in ``adata.obsm``.
-        Defaults to ``"{use_rep}_mnn_corrected"``
-        (or ``"X_pca_mnn_corrected"`` when ``use_rep=None``).
-        Reference cells are initialised to their original representation and
-        are unchanged.
+        Optional output key written into ``adata.obsm``.
     copy
-        Return a corrected copy instead of modifying in-place.
+        If ``True``, return a corrected copy of ``adata``.
     nogpu
-        Force CPU-based neighbour search.
+        If ``True``, force CPU-based neighbour search.
     verbose
-        Print progress messages.
+        If ``True``, print progress messages.
 
     Returns
     -------
-    adata : AnnData or None
-        The corrected AnnData if ``copy=True``, else ``None``.
-    correctors : list[MNNCorrector]
-        One fitted :class:`MNNCorrector` per correction round, in order.
-
-    Raises
-    ------
-    KeyError
-        If ``batch_key`` or ``use_rep`` are not found in ``adata``.
-    ValueError
-        If ``reference`` and ``batch_order`` are both provided, or if a
-        batch label cannot be resolved.
-
-    Examples
-    --------
-    >>> # Sequential (3 batches)
-    >>> _, correctors = mnn_correct_adata(
-    ...     adata, batch_key="batch", use_rep="X_scVI",
-    ...     batch_order=["batch1", "batch2", "batch3"],
-    ... )
-
-    >>> # Fixed reference
-    >>> _, correctors = mnn_correct_adata(
-    ...     adata, batch_key="batch", use_rep="X_scVI", reference="atlas",
-    ... )
+    tuple[AnnData | None, MNNCorrector]
+        Pair of corrected AnnData result and fitted corrector. The AnnData
+        entry is ``None`` when ``copy=False``.
     """
-    # ── Validation ─────────────────────────────────────────────────────── #
-    if batch_key not in adata.obs.columns:
-        raise KeyError(f"batch_key '{batch_key}' not found in adata.obs.")
-    if reference is not None and batch_order is not None:
-        raise ValueError(
-            "Provide either 'reference' (fixed-reference mode) or 'batch_order' "
-            "(sequential mode), not both."
-        )
-
-    observed: List[str] = sorted(adata.obs[batch_key].unique().tolist())
-
-    if reference is not None and reference not in observed:
-        raise ValueError(
-            f"reference '{reference}' not found in adata.obs['{batch_key}']. "
-            f"Available: {observed}."
-        )
-    if batch_order is not None:
-        missing = set(observed) - set(batch_order)
-        extra = set(batch_order) - set(observed)
-        if missing:
-            raise ValueError(
-                f"batch_order is missing labels present in the data: {sorted(missing)}."
-            )
-        if extra:
-            raise ValueError(
-                f"batch_order contains labels not found in the data: {sorted(extra)}."
-            )
-
-    if copy:
-        adata = adata.copy()
-
-    # ── Resolve source representation ──────────────────────────────────── #
-    if use_rep is None:
-        if adata.X is None:
-            raise ValueError("use_rep=None requires adata.X to be non-None.")
-        import scipy.sparse as sp
-        from sklearn.decomposition import PCA
-
-        if verbose:
-            print(
-                f"[mnn_correct_adata] use_rep=None — running joint PCA "
-                f"(n_components={n_pca_components}) across all {adata.n_obs:,} cells..."
-            )
-        X_all = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
-        n_comp = min(n_pca_components, adata.n_obs - 1, adata.n_vars)
-        _pca_key = "_X_pca_mnn_joint"
-        adata.obsm[_pca_key] = PCA(n_components=n_comp).fit_transform(X_all)
-        src_rep = _pca_key
-        _key_added = key_added or "X_pca_mnn_corrected"
-    else:
-        if use_rep not in adata.obsm:
-            raise KeyError(f"use_rep '{use_rep}' not found in adata.obsm.")
-        src_rep = use_rep
-        _key_added = key_added or f"{use_rep}_mnn_corrected"
-
-    # Initialise key_added for all cells as a copy of the source representation.
-    # Reference cells will keep these values unchanged.
-    adata.obsm[_key_added] = np.asarray(adata.obsm[src_rep]).copy()
-
-    correctors: List[MNNCorrector] = []
-
-    # ── Sequential mode ────────────────────────────────────────────────── #
-    if reference is None:
-        order: List[str] = batch_order if batch_order is not None else observed
-        if verbose:
-            print(
-                f"[mnn_correct_adata] Sequential mode — "
-                f"batch order: {order}"
-            )
-
-        for i in range(1, len(order)):
-            query_label = order[i]
-            ref_labels = order[:i]
-            ref_mask = adata.obs[batch_key].isin(ref_labels).values
-            query_mask = (adata.obs[batch_key] == query_label).values
-
-            if verbose:
-                print(
-                    f"\n[mnn_correct_adata] Round {i}/{len(order) - 1}: "
-                    f"ref={ref_labels} ({ref_mask.sum():,} cells)  →  "
-                    f"query='{query_label}' ({query_mask.sum():,} cells)"
-                )
-
-            # Use copies so that obsm assignments inside mnn_correct are safe
-            adata_ref_i = adata[ref_mask].copy()
-            adata_query_i = adata[query_mask].copy()
-
-            corrector_i = mnn_correct(
-                adata_ref_i, adata_query_i,
-                use_rep=_key_added,
-                k_mnn=k_mnn, k_propagate=k_propagate,
-                weighting_scheme=weighting_scheme,
-                store_for_projection=store_for_projection,
-                batch_label=query_label,
-                key_added=_key_added,
-                nogpu=nogpu, verbose=verbose,
-            )
-            correctors.append(corrector_i)
-
-            # Write corrected embeddings back into the main adata
-            adata.obsm[_key_added][query_mask] = adata_query_i.obsm[_key_added]
-
-    # ── Fixed-reference mode ───────────────────────────────────────────── #
-    else:
-        query_labels = [b for b in observed if b != reference]
-        if verbose:
-            print(
-                f"[mnn_correct_adata] Fixed-reference mode — "
-                f"reference='{reference}', query batches: {query_labels}"
-            )
-
-        ref_mask = (adata.obs[batch_key] == reference).values
-        adata_ref_base = adata[ref_mask].copy()
-
-        for qi, query_label in enumerate(query_labels):
-            query_mask = (adata.obs[batch_key] == query_label).values
-
-            if verbose:
-                print(
-                    f"\n[mnn_correct_adata] Round {qi + 1}/{len(query_labels)}: "
-                    f"ref='{reference}' ({ref_mask.sum():,} cells)  →  "
-                    f"query='{query_label}' ({query_mask.sum():,} cells)"
-                )
-
-            adata_query_i = adata[query_mask].copy()
-
-            corrector_i = mnn_correct(
-                adata_ref_base, adata_query_i,
-                use_rep=_key_added,
-                k_mnn=k_mnn, k_propagate=k_propagate,
-                weighting_scheme=weighting_scheme,
-                store_for_projection=store_for_projection,
-                batch_label=query_label,
-                key_added=_key_added,
-                nogpu=nogpu, verbose=verbose,
-            )
-            correctors.append(corrector_i)
-
-            adata.obsm[_key_added][query_mask] = adata_query_i.obsm[_key_added]
-
-    if verbose:
-        print(
-            f"\n[mnn_correct_adata] Complete.  Corrected embedding stored in "
-            f"adata.obsm['{_key_added}']."
-        )
-
-    return (adata if copy else None), correctors
+    corrector = MNNCorrector(
+        k_mnn=k_mnn,
+        k_propagate=k_propagate,
+        weighting_scheme=weighting_scheme,
+        store_for_projection=store_for_projection,
+        nogpu=nogpu,
+        verbose=verbose,
+    )
+    corrector.fit(
+        adata,
+        batch_key=batch_key,
+        batch_order=batch_order,
+        reference=reference,
+        use_rep=use_rep,
+        n_pca_components=n_pca_components,
+        key_added=key_added,
+    )
+    result = corrector.correct(adata, key_added=key_added, copy=copy)
+    return result, corrector

@@ -14,6 +14,7 @@ dependencies = [
     "anndata>=0.9",
     "numpy>=1.23",
     "pandas>=1.5",
+    "scanpy>=1.10",
     "scipy>=1.10",
     "scikit-learn>=1.1",
     "pynndescent>=0.5",

@@ -1,0 +1,66 @@
+"""Shared helper utilities for correction workflows."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+import numpy as np
+from scipy.sparse import diags
+
+from . import wknn
+
+WeightingScheme = Literal[
+    "n",
+    "top_n",
+    "jaccard",
+    "jaccard_square",
+    "gaussian",
+    "dist",
+]
+def propagate_weighted(
+    emb_new: np.ndarray,
+    ref_emb: np.ndarray,
+    ref_disp: np.ndarray,
+    k: int,
+    weighting_scheme: WeightingScheme,
+    nogpu: bool,
+    verbose: bool,
+) -> np.ndarray:
+    """Propagate known displacement vectors from reference cells to new cells.
+
+    Parameters
+    ----------
+    emb_new
+        Embeddings of cells that should receive a correction.
+    ref_emb
+        Embeddings of reference cells with known displacement vectors.
+    ref_disp
+        Displacement vectors associated with ``ref_emb``.
+    k
+        Number of neighbours used during propagation.
+    weighting_scheme
+        Weighting scheme used by the weighted KNN graph.
+    nogpu
+        If ``True``, force CPU-based neighbour search.
+    verbose
+        If ``True``, print neighbour-search progress messages.
+
+    Returns
+    -------
+    numpy.ndarray
+        Propagated displacement matrix with one row per cell in ``emb_new``.
+    """
+    k_eff = min(k, ref_emb.shape[0])
+    wknn_prop = wknn.get_wknn(
+        ref=ref_emb,
+        query=emb_new,
+        k=k_eff,
+        query2ref=True,
+        ref2query=False,
+        weighting_scheme=weighting_scheme,
+        nogpu=nogpu,
+        verbose=verbose,
+    )
+    row_sums = np.array(wknn_prop.sum(axis=1)).flatten()
+    row_sums[row_sums == 0] = 1.0
+    return diags(1.0 / row_sums).dot(wknn_prop).dot(ref_disp)
