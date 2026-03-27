@@ -6,6 +6,7 @@ from scipy import sparse
 
 import mnn_correct
 from mnn_correct import MNNCorrector, mnn_correct as mnn_correct_fn, mnn_correct_adata
+from mnn_correct.util import wknn
 
 
 def _make_batch(n: int = 40, d: int = 8, shift: float = 0.0, seed: int = 0) -> np.ndarray:
@@ -106,6 +107,93 @@ def test_public_api() -> None:
     assert hasattr(mnn_correct, "MNNCorrector")
     assert hasattr(mnn_correct, "mnn_correct")
     assert hasattr(mnn_correct, "mnn_correct_adata")
+
+
+def test_build_nn_sklearn_flavor() -> None:
+    ref = _make_batch(20, 5, seed=1)
+    query = _make_batch(10, 5, seed=2)
+
+    adj = wknn.build_nn(ref=ref, query=query, k=3, flavor="sklearn", verbose=False)
+
+    assert adj.shape == (10, 20)
+    assert np.all(np.asarray(adj.sum(axis=1)).ravel() == 3)
+
+
+def test_build_nn_pynndescent_flavor() -> None:
+    ref = _make_batch(30, 5, seed=3)
+    query = _make_batch(12, 5, seed=4)
+
+    adj = wknn.build_nn(ref=ref, query=query, k=4, flavor="pynndescent", verbose=False)
+
+    assert adj.shape == (12, 30)
+    assert np.all(np.asarray(adj.sum(axis=1)).ravel() == 4)
+
+
+def test_build_nn_auto_prefers_sklearn_for_small_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _make_batch(50, 5, seed=5)
+    query = _make_batch(40, 5, seed=6)
+
+    def _fail_nn_descent(*args: object, **kwargs: object) -> object:
+        raise AssertionError("pynndescent should not be used for small auto inputs")
+
+    monkeypatch.setattr(wknn, "NNDescent", _fail_nn_descent)
+
+    adj = wknn.build_nn(ref=ref, query=query, k=3, flavor="auto", verbose=False)
+
+    assert adj.shape == (40, 50)
+
+
+def test_build_nn_auto_falls_back_to_pynndescent_for_large_cpu_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref = _make_batch(1000, 5, seed=7)
+    query = _make_batch(1000, 5, seed=8)
+    calls: list[str] = []
+
+    class DummyNNDescent:
+        def __init__(self, data: np.ndarray) -> None:
+            calls.append("init")
+            self._data = data
+
+        def query(self, query_data: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+            calls.append("query")
+            indices = np.tile(np.arange(k), (query_data.shape[0], 1))
+            distances = np.zeros((query_data.shape[0], k), dtype=float)
+            return indices, distances
+
+    monkeypatch.setattr(wknn, "NNDescent", DummyNNDescent)
+    monkeypatch.setattr(wknn.torch.cuda, "is_available", lambda: False)
+
+    adj = wknn.build_nn(ref=ref, query=query, k=3, flavor="auto", verbose=False)
+
+    assert adj.shape == (1000, 1000)
+    assert calls == ["init", "query"]
+
+
+def test_build_mutual_nn_sklearn_flavor() -> None:
+    dat1 = _make_batch(18, 5, seed=9)
+    dat2 = _make_batch(15, 5, seed=10)
+
+    adj = wknn.build_mutual_nn(dat1=dat1, dat2=dat2, k1=3, flavor="sklearn", verbose=False)
+
+    assert adj.shape == (18, 15)
+    assert adj.nnz >= 0
+
+
+def test_build_mutual_nn_auto_prefers_sklearn_for_small_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dat1 = _make_batch(40, 5, seed=11)
+    dat2 = _make_batch(35, 5, seed=12)
+
+    def _fail_nn_descent(*args: object, **kwargs: object) -> object:
+        raise AssertionError("pynndescent should not be used for small auto mutual NN inputs")
+
+    monkeypatch.setattr(wknn, "NNDescent", _fail_nn_descent)
+
+    adj = wknn.build_mutual_nn(dat1=dat1, dat2=dat2, k1=3, flavor="auto", verbose=False)
+
+    assert adj.shape == (40, 35)
 
 
 def test_corrector_fit_stores_batch_models() -> None:

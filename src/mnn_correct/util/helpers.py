@@ -17,13 +17,16 @@ WeightingScheme = Literal[
     "gaussian",
     "dist",
 ]
+NeighborFlavor = wknn.NeighborFlavor
+
+
 def propagate_weighted(
     emb_new: np.ndarray,
     ref_emb: np.ndarray,
     ref_disp: np.ndarray,
     k: int,
     weighting_scheme: WeightingScheme,
-    nogpu: bool,
+    flavor: NeighborFlavor,
     verbose: bool,
 ) -> np.ndarray:
     """Propagate known displacement vectors from reference cells to new cells.
@@ -40,8 +43,8 @@ def propagate_weighted(
         Number of neighbours used during propagation.
     weighting_scheme
         Weighting scheme used by the weighted KNN graph.
-    nogpu
-        If ``True``, force CPU-based neighbour search.
+    flavor
+        Neighbor-search backend.
     verbose
         If ``True``, print neighbour-search progress messages.
 
@@ -58,7 +61,7 @@ def propagate_weighted(
         query2ref=True,
         ref2query=False,
         weighting_scheme=weighting_scheme,
-        nogpu=nogpu,
+        flavor=flavor,
         verbose=verbose,
     )
     row_sums = np.array(wknn_prop.sum(axis=1)).flatten()

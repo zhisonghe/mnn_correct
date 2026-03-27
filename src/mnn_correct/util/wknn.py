@@ -11,6 +11,9 @@ import pandas as pd
 import torch
 from pynndescent import NNDescent
 from scipy import sparse
+from sklearn.neighbors import NearestNeighbors as SklearnNearestNeighbors
+
+NeighborFlavor = Literal["auto", "cuml", "sklearn", "pynndescent"]
 
 
 def gaussian_kernel(d, sigma=None):
@@ -93,13 +96,20 @@ def build_nn(
     k: int = 100,
     weight: Literal["unweighted", "dist", "gaussian_kernel"] = "unweighted",
     sigma=None,
-    nogpu: bool = False,
+    flavor: NeighborFlavor = "auto",
     verbose: bool = True,
 ):
     """Build a k-nearest-neighbour graph from *query* into *ref*.
 
-    Uses cuML/GPU when available and ``nogpu=False``, otherwise falls back to
-    :class:`~pynndescent.NNDescent`.
+    Supports exact CPU neighbours via scikit-learn, approximate CPU neighbours
+    via :class:`~pynndescent.NNDescent`, and GPU neighbours via cuML.
+
+    ``flavor="auto"`` selects the backend as follows:
+
+    1. Use scikit-learn when both ``ref`` and ``query`` contain fewer than
+       1000 cells.
+    2. Otherwise use cuML when CUDA is available and ``cuml`` is installed.
+    3. Otherwise fall back to pynndescent.
 
     Parameters
     ----------
@@ -113,8 +123,9 @@ def build_nn(
         Edge-weighting scheme (see :func:`nn2adj`).
     sigma
         Gaussian-kernel bandwidth (ignored unless ``weight="gaussian_kernel"``).
-    nogpu
-        Force CPU-based search.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
     verbose
         Print backend selection message.
 
@@ -126,7 +137,30 @@ def build_nn(
     if query is None:
         query = ref
 
-    if torch.cuda.is_available() and importlib.util.find_spec("cuml") and not nogpu:
+    if flavor not in ("auto", "cuml", "sklearn", "pynndescent"):
+        raise ValueError(
+            f"Unsupported flavor '{flavor}'. Expected one of "
+            "'auto', 'cuml', 'sklearn', or 'pynndescent'."
+        )
+
+    has_gpu = torch.cuda.is_available()
+    has_cuml = importlib.util.find_spec("cuml") is not None
+
+    if flavor == "auto":
+        if ref.shape[0] < 1000 and query.shape[0] < 1000:
+            backend = "sklearn"
+        elif has_gpu and has_cuml:
+            backend = "cuml"
+        else:
+            backend = "pynndescent"
+    else:
+        backend = flavor
+
+    if backend == "cuml":
+        if not has_gpu or not has_cuml:
+            raise RuntimeError(
+                "flavor='cuml' requires both CUDA availability and the cuml package."
+            )
         if verbose:
             print("GPU detected and cuml installed. Use cuML for neighborhood estimation...")
         from cuml.neighbors import NearestNeighbors
@@ -134,6 +168,13 @@ def build_nn(
         model = NearestNeighbors(n_neighbors=k)
         model.fit(ref)
         knn = (model.kneighbors(query)[1], model.kneighbors(query)[0])
+    elif backend == "sklearn":
+        if verbose:
+            print("Using exact neighborhood estimation with scikit-learn")
+        model = SklearnNearestNeighbors(n_neighbors=k)
+        model.fit(ref)
+        distances, indices = model.kneighbors(query)
+        knn = (indices, distances)
     else:
         if verbose:
             print("Falling back to neighborhood estimation using CPU with pynndescent")
@@ -143,7 +184,14 @@ def build_nn(
     return nn2adj(knn, n1=query.shape[0], n2=ref.shape[0], weight=weight, sigma=sigma)
 
 
-def build_mutual_nn(dat1, dat2=None, k1: int = 100, k2: Optional[int] = None):
+def build_mutual_nn(
+    dat1,
+    dat2=None,
+    k1: int = 100,
+    k2: Optional[int] = None,
+    flavor: NeighborFlavor = "auto",
+    verbose: bool = True,
+):
     """Return the mutual nearest-neighbour adjacency matrix between *dat1* and *dat2*.
 
     Parameters
@@ -156,6 +204,11 @@ def build_mutual_nn(dat1, dat2=None, k1: int = 100, k2: Optional[int] = None):
         Number of neighbours from *dat2* into *dat1*.
     k2
         Number of neighbours from *dat1* into *dat2*.  Defaults to *k1*.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
+    verbose
+        Print backend selection messages.
 
     Returns
     -------
@@ -169,12 +222,22 @@ def build_mutual_nn(dat1, dat2=None, k1: int = 100, k2: Optional[int] = None):
     if k2 is None:
         k2 = k1
 
-    index_1 = NNDescent(dat1)
-    index_2 = NNDescent(dat2)
-    knn_21 = index_1.query(dat2, k=k1)
-    knn_12 = index_2.query(dat1, k=k2)
-    adj_21 = nn2adj(knn_21, n1=dat2.shape[0], n2=dat1.shape[0])
-    adj_12 = nn2adj(knn_12, n1=dat1.shape[0], n2=dat2.shape[0])
+    adj_21 = build_nn(
+        ref=dat1,
+        query=dat2,
+        k=k1,
+        weight="unweighted",
+        flavor=flavor,
+        verbose=verbose,
+    )
+    adj_12 = build_nn(
+        ref=dat2,
+        query=dat1,
+        k=k2,
+        weight="unweighted",
+        flavor=flavor,
+        verbose=verbose,
+    )
 
     return adj_12.multiply(adj_21.T)
 
@@ -192,7 +255,7 @@ def get_wknn(
     top_n: Optional[int] = None,
     sigma: Optional[float] = None,
     return_adjs: bool = False,
-    nogpu: bool = False,
+    flavor: NeighborFlavor = "auto",
     verbose: bool = True,
 ):
     """Build a weighted k-nearest-neighbour graph between *query* and *ref*.
@@ -225,8 +288,9 @@ def get_wknn(
         Gaussian bandwidth (``"gaussian"`` scheme only).
     return_adjs
         If ``True``, also return intermediate adjacency matrices as a dict.
-    nogpu
-        Force CPU-based neighbour search.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
     verbose
         Print progress messages.
 
@@ -240,13 +304,13 @@ def get_wknn(
     weight_for_nn = "dist" if weighting_scheme in ("gaussian", "dist") else "unweighted"
 
     adj_q2r = build_nn(
-        ref=ref, query=query, k=k, weight=weight_for_nn, nogpu=nogpu, verbose=verbose
+        ref=ref, query=query, k=k, weight=weight_for_nn, flavor=flavor, verbose=verbose
     )
 
     adj_r2q = None
     if ref2query:
         adj_r2q = build_nn(
-            ref=query, query=ref, k=k, weight=weight_for_nn, nogpu=nogpu, verbose=verbose
+            ref=query, query=ref, k=k, weight=weight_for_nn, flavor=flavor, verbose=verbose
         )
 
     if query2ref and not ref2query:
@@ -268,7 +332,7 @@ def get_wknn(
     if weighting_scheme in ("n", "top_n", "jaccard", "jaccard_square"):
         if ref2 is None:
             ref2 = ref
-        adj_ref = build_nn(ref=ref2, k=k, nogpu=nogpu, verbose=verbose)
+        adj_ref = build_nn(ref=ref2, k=k, flavor=flavor, verbose=verbose)
         num_shared = adj_q2r @ adj_ref.T
         wknn = num_shared.multiply(adj_knn.T).copy()
 

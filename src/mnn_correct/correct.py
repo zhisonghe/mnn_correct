@@ -9,7 +9,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData, concat
 
-from .util import WeightingScheme, propagate_weighted, wknn
+from .util import NeighborFlavor, WeightingScheme, propagate_weighted, wknn
 
 
 class MNNCorrector:
@@ -38,9 +38,10 @@ class MNNCorrector:
         Whether to retain per-batch projection state after fitting. When
         ``use_rep=None``, this is forced to ``False`` because the PCA fallback
         only supports the current correction run.
-    nogpu
-        If ``True``, force CPU-based neighbour search even when GPU support is
-        available.
+    flavor
+        Neighbor-search backend. Use ``"auto"`` to select scikit-learn for
+        small inputs, cuML for large GPU-enabled inputs, and pynndescent
+        otherwise.
     verbose
         If ``True``, print progress messages during fitting and projection.
 
@@ -63,7 +64,7 @@ class MNNCorrector:
         k_propagate: int = 20,
         weighting_scheme: WeightingScheme = "jaccard_square",
         store_for_projection: bool = True,
-        nogpu: bool = False,
+        flavor: NeighborFlavor = "auto",
         verbose: bool = True,
     ) -> None:
         """Initialize a stateful MNN corrector."""
@@ -72,7 +73,7 @@ class MNNCorrector:
         self.weighting_scheme = weighting_scheme
         self._store_for_projection_requested = store_for_projection
         self.store_for_projection = store_for_projection
-        self.nogpu = nogpu
+        self.flavor = flavor
         self.verbose = verbose
 
         self.emb_query_with_mnn_: Optional[np.ndarray] = None
@@ -175,24 +176,14 @@ class MNNCorrector:
                 f"(batch='{batch_label}')..."
             )
 
-        nn_q2r = wknn.build_nn(
-            ref=emb_ref,
-            query=emb_query,
-            k=self.k_mnn,
-            weight="unweighted",
-            nogpu=self.nogpu,
+        mnn_matrix = wknn.build_mutual_nn(
+            dat1=emb_query,
+            dat2=emb_ref,
+            k1=self.k_mnn,
+            k2=self.k_mnn,
+            flavor=self.flavor,
             verbose=self.verbose,
         )
-        nn_r2q = wknn.build_nn(
-            ref=emb_query,
-            query=emb_ref,
-            k=self.k_mnn,
-            weight="unweighted",
-            nogpu=self.nogpu,
-            verbose=self.verbose,
-        )
-
-        mnn_matrix = (nn_q2r + nn_r2q.T) == 2
         idx_i, idx_j = mnn_matrix.nonzero()
         if len(idx_i) == 0:
             raise ValueError(
@@ -222,7 +213,7 @@ class MNNCorrector:
                 ref_disp=disp_anchor,
                 k=self.k_propagate,
                 weighting_scheme=self.weighting_scheme,
-                nogpu=self.nogpu,
+                flavor=self.flavor,
                 verbose=self.verbose,
             )
         )
@@ -391,7 +382,7 @@ class MNNCorrector:
             ref_disp=ref_disp,
             k=self.k_propagate,
             weighting_scheme=self.weighting_scheme,
-            nogpu=self.nogpu,
+            flavor=self.flavor,
             verbose=self.verbose,
         )
         return emb_new + np.asarray(displacement)
@@ -718,7 +709,7 @@ def mnn_correct(
     store_for_projection: bool = True,
     batch_label: Optional[str] = None,
     key_added: Optional[str] = None,
-    nogpu: bool = False,
+    flavor: NeighborFlavor = "auto",
     verbose: bool = True,
 ) -> MNNCorrector:
     """Correct batch effects between two AnnData objects using MNN.
@@ -748,8 +739,9 @@ def mnn_correct(
         Label used to store the query batch model for later projection.
     key_added
         Optional output key written into ``adata_query.obsm``.
-    nogpu
-        If ``True``, force CPU-based neighbour search.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
     verbose
         If ``True``, print progress messages.
 
@@ -775,7 +767,7 @@ def mnn_correct(
         k_propagate=k_propagate,
         weighting_scheme=weighting_scheme,
         store_for_projection=store_for_projection,
-        nogpu=nogpu,
+        flavor=flavor,
         verbose=verbose,
     )
     corrector.fit(
@@ -812,7 +804,7 @@ def mnn_correct_adata(
     store_for_projection: bool = True,
     key_added: Optional[str] = None,
     copy: bool = False,
-    nogpu: bool = False,
+    flavor: NeighborFlavor = "auto",
     verbose: bool = True,
 ) -> Tuple[Optional[AnnData], MNNCorrector]:
     """Fit and apply MNN batch correction on a single AnnData object.
@@ -846,8 +838,9 @@ def mnn_correct_adata(
         Optional output key written into ``adata.obsm``.
     copy
         If ``True``, return a corrected copy of ``adata``.
-    nogpu
-        If ``True``, force CPU-based neighbour search.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
     verbose
         If ``True``, print progress messages.
 
@@ -862,7 +855,7 @@ def mnn_correct_adata(
         k_propagate=k_propagate,
         weighting_scheme=weighting_scheme,
         store_for_projection=store_for_projection,
-        nogpu=nogpu,
+        flavor=flavor,
         verbose=verbose,
     )
     corrector.fit(
