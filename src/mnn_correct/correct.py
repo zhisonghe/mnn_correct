@@ -396,7 +396,8 @@ class MNNCorrector:
         use_rep: Optional[str] = None,
         n_pca_components: int = 50,
         key_added: Optional[str] = None,
-    ) -> "MNNCorrector":
+        return_corrector: bool = False,
+    ) -> Optional["MNNCorrector"]:
         """Estimate and store per-batch displacement models from an AnnData object.
 
         Parameters
@@ -421,11 +422,16 @@ class MNNCorrector:
         key_added
             Optional output key for corrected embeddings written by
             :meth:`correct` and :meth:`project`.
+        return_corrector
+            If ``True``, return the fitted corrector instance after updating
+            its internal state. By default, :meth:`fit` only updates the
+            current object and returns ``None``.
 
         Returns
         -------
-        MNNCorrector
-            The fitted corrector instance.
+        MNNCorrector or None
+            The fitted corrector instance when ``return_corrector=True``;
+            otherwise ``None``.
 
         Raises
         ------
@@ -553,7 +559,7 @@ class MNNCorrector:
                 f"{self.n_corrections_:,} batch correction round(s)."
             )
 
-        return self
+        return self if return_corrector else None
 
     def correct(
         self,

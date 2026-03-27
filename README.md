@@ -9,6 +9,10 @@ supports three steps:
 3. `project()` propagates an already learned batch displacement onto new cells
    from the same batch label.
 
+By default, `fit()` updates the current `MNNCorrector` in place and returns
+`None`. Pass `return_corrector=True` if you want it to return the fitted
+corrector instance for chaining.
+
 ## Installation
 
 Install the package in editable mode for development:
@@ -59,6 +63,15 @@ corrector.fit(
 	batch_key="batch",
 	batch_order=["reference", "query_a", "query_b"],
 	use_rep="X_scVI",
+)
+
+# Optional chaining-friendly form:
+same_corrector = corrector.fit(
+	adata,
+	batch_key="batch",
+	batch_order=["reference", "query_a", "query_b"],
+	use_rep="X_scVI",
+	return_corrector=True,
 )
 ```
 
@@ -176,6 +189,8 @@ You can override this with `key_added` in `fit()`, `correct()`, `project()`,
 ## Important Behavior
 
 - `fit()` does not modify the input `AnnData`.
+- `fit()` updates the `MNNCorrector` in place and returns `None` unless
+	`return_corrector=True` is passed.
 - `correct()` applies only to the same fitted dataset and validates that both
   the cells and source representation match the fitted state.
 - `project()` is for new cells from a batch label already seen during `fit()`.

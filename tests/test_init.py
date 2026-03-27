@@ -200,19 +200,35 @@ def test_corrector_fit_stores_batch_models() -> None:
     adata = _make_combined_adata(n_batches=3)
     corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
 
-    corrector.fit(
+    result = corrector.fit(
         adata,
         batch_key="batch",
         batch_order=["batch0", "batch1", "batch2"],
         use_rep="X_test",
     )
 
+    assert result is None
     assert corrector.is_fitted
     assert corrector.n_corrections_ == 2
     assert set(corrector.projection_data_) == {"batch1", "batch2"}
     assert corrector.key_added_ == "X_test_mnn_corrected"
     assert corrector.n_mnn_pairs_ > 0
     assert corrector.n_query_with_mnn_ > 0
+
+
+def test_corrector_fit_can_optionally_return_corrector() -> None:
+    adata = _make_combined_adata(n_batches=2)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=10, verbose=False)
+
+    result = corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+        return_corrector=True,
+    )
+
+    assert result is corrector
 
 
 def test_corrector_correct_writes_obsm() -> None:
