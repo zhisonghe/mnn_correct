@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import Literal
 
 import numpy as np
 from scipy.sparse import diags
 
 from . import wknn
+
+
+def tprint(*args, **kwargs):
+    """Print with an ISO-8601 timestamp prefix."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}]", *args, **kwargs)
 
 WeightingScheme = Literal[
     "n",

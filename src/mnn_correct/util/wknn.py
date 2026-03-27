@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import warnings
 from typing import Literal, Optional
@@ -12,6 +13,12 @@ import torch
 from pynndescent import NNDescent
 from scipy import sparse
 from sklearn.neighbors import NearestNeighbors as SklearnNearestNeighbors
+
+
+def _tprint(*args, **kwargs):
+    """Print with an ISO-8601 timestamp prefix."""
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}]", *args, **kwargs)
 
 NeighborFlavor = Literal["auto", "cuml", "sklearn", "pynndescent"]
 
@@ -162,7 +169,10 @@ def build_nn(
                 "flavor='cuml' requires both CUDA availability and the cuml package."
             )
         if verbose:
-            print("GPU detected and cuml installed. Use cuML for neighborhood estimation...")
+            _tprint(
+                f"[build_nn] Using cuML for neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
         from cuml.neighbors import NearestNeighbors
 
         model = NearestNeighbors(n_neighbors=k)
@@ -170,14 +180,20 @@ def build_nn(
         knn = (model.kneighbors(query)[1], model.kneighbors(query)[0])
     elif backend == "sklearn":
         if verbose:
-            print("Using exact neighborhood estimation with scikit-learn")
+            _tprint(
+                f"[build_nn] Using scikit-learn for exact neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
         model = SklearnNearestNeighbors(n_neighbors=k)
         model.fit(ref)
         distances, indices = model.kneighbors(query)
         knn = (indices, distances)
     else:
         if verbose:
-            print("Falling back to neighborhood estimation using CPU with pynndescent")
+            _tprint(
+                f"[build_nn] Using pynndescent for approximate neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
         index = NNDescent(ref)
         knn = index.query(query, k=k)
 

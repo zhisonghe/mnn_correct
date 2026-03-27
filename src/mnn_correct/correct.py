@@ -9,7 +9,7 @@ import pandas as pd
 import scanpy as sc
 from anndata import AnnData, concat
 
-from .util import NeighborFlavor, WeightingScheme, propagate_weighted, wknn
+from .util import NeighborFlavor, WeightingScheme, propagate_weighted, tprint, wknn
 
 
 class MNNCorrector:
@@ -169,7 +169,7 @@ class MNNCorrector:
             counts.
         """
         if self.verbose:
-            print(
+            tprint(
                 f"[MNNCorrector.fit] Finding MNN pairs (k_mnn={self.k_mnn}) "
                 f"between {emb_query.shape[0]:,} query and "
                 f"{emb_ref.shape[0]:,} reference cells "
@@ -219,7 +219,7 @@ class MNNCorrector:
         )
 
         if self.verbose:
-            print(
+            tprint(
                 f"[MNNCorrector.fit] Found {len(idx_i):,} MNN pairs covering "
                 f"{len(unique_idx_i):,} query anchor cells for batch '{batch_label}'."
             )
@@ -267,7 +267,7 @@ class MNNCorrector:
                 raise ValueError("use_rep=None requires adata.X to be non-None.")
 
             if self.verbose:
-                print(
+                tprint(
                     f"[MNNCorrector.fit] use_rep=None -- running scanpy.pp.pca "
                     f"(n_components={n_pca_components}) across all {adata.n_obs:,} cells..."
                 )
@@ -370,7 +370,7 @@ class MNNCorrector:
             ref_desc = f"anchor cells from batch='{batch_label}'"
 
         if self.verbose:
-            print(
+            tprint(
                 f"[MNNCorrector.project] Projecting {emb_new.shape[0]:,} cells using {ref_desc} "
                 f"(k_propagate={min(self.k_propagate, ref_emb.shape[0])}, "
                 f"weighting='{self.weighting_scheme}')..."
@@ -475,7 +475,7 @@ class MNNCorrector:
         if use_rep is None:
             self.store_for_projection = False
             if self.verbose and self._store_for_projection_requested:
-                print(
+                tprint(
                     "[MNNCorrector.fit] use_rep=None disables future projection; "
                     "store_for_projection has been forced to False for this fit."
                 )
@@ -492,7 +492,7 @@ class MNNCorrector:
             order = batch_order if batch_order is not None else observed
             self.batch_order_ = list(order)
             if self.verbose:
-                print(f"[MNNCorrector.fit] Sequential mode -- batch order: {order}")
+                tprint(f"[MNNCorrector.fit] Sequential mode -- batch order: {order}")
 
             for index in range(1, len(order)):
                 query_label = order[index]
@@ -501,7 +501,7 @@ class MNNCorrector:
                 query_mask = (batch_values == query_label).to_numpy()
 
                 if self.verbose:
-                    print(
+                    tprint(
                         f"[MNNCorrector.fit] Round {index}/{len(order) - 1}: "
                         f"ref={ref_labels} ({int(ref_mask.sum()):,} cells) -> "
                         f"query='{query_label}' ({int(query_mask.sum()):,} cells)"
@@ -522,7 +522,7 @@ class MNNCorrector:
             ref_mask = (batch_values == reference).to_numpy()
             query_labels = [label for label in observed if label != reference]
             if self.verbose:
-                print(
+                tprint(
                     f"[MNNCorrector.fit] Fixed-reference mode -- reference='{reference}', "
                     f"query batches: {query_labels}"
                 )
@@ -531,7 +531,7 @@ class MNNCorrector:
                 query_mask = (batch_values == query_label).to_numpy()
 
                 if self.verbose:
-                    print(
+                    tprint(
                         f"[MNNCorrector.fit] Round {index}/{len(query_labels)}: "
                         f"ref='{reference}' ({int(ref_mask.sum()):,} cells) -> "
                         f"query='{query_label}' ({int(query_mask.sum()):,} cells)"
@@ -554,7 +554,7 @@ class MNNCorrector:
         self.n_corrections_ = len(self.fitted_batches_)
 
         if self.verbose:
-            print(
+            tprint(
                 f"[MNNCorrector.fit] Stored displacement models for "
                 f"{self.n_corrections_:,} batch correction round(s)."
             )
@@ -625,7 +625,7 @@ class MNNCorrector:
         target.obsm[target_key] = self._corrected_embeddings_[indexer].copy()
 
         if self.verbose:
-            print(
+            tprint(
                 f"[MNNCorrector.correct] Corrected embedding stored in adata.obsm['{target_key}']."
             )
 
