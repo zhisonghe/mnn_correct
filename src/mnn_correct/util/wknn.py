@@ -190,7 +190,7 @@ def build_mutual_nn(
     k1: int = 100,
     k2: Optional[int] = None,
     flavor: NeighborFlavor = "auto",
-    verbose: bool = True,
+    verbose: bool = False,
 ):
     """Return the mutual nearest-neighbour adjacency matrix between *dat1* and *dat2*.
 
@@ -256,7 +256,7 @@ def get_wknn(
     sigma: Optional[float] = None,
     return_adjs: bool = False,
     flavor: NeighborFlavor = "auto",
-    verbose: bool = True,
+    verbose: bool = False,
 ):
     """Build a weighted k-nearest-neighbour graph between *query* and *ref*.
 
