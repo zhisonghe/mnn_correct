@@ -97,7 +97,7 @@ def build_nn(
     weight: Literal["unweighted", "dist", "gaussian_kernel"] = "unweighted",
     sigma=None,
     flavor: NeighborFlavor = "auto",
-    verbose: bool = True,
+    verbose: bool = False,
 ):
     """Build a k-nearest-neighbour graph from *query* into *ref*.
 
