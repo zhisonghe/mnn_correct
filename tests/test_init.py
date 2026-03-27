@@ -211,6 +211,7 @@ def test_corrector_fit_stores_batch_models() -> None:
     assert corrector.is_fitted
     assert corrector.n_corrections_ == 2
     assert set(corrector.projection_data_) == {"batch1", "batch2"}
+    assert corrector.projection_identity_batch_ == "batch0"
     assert corrector.key_added_ == "X_test_mnn_corrected"
     assert corrector.n_mnn_pairs_ > 0
     assert corrector.n_query_with_mnn_ > 0
@@ -278,10 +279,11 @@ def test_corrector_project_writes_obsm() -> None:
     )
 
     new_obs = pd.DataFrame(index=[f"new_{i}" for i in range(20)])
+    new_obs["batch"] = "batch1"
     adata_new = ad.AnnData(X=np.zeros((20, 4)), obs=new_obs)
     adata_new.obsm["X_test"] = _make_batch(20, 8, 3.0, seed=99)
 
-    corrector.project(adata_new, batch_label="batch1")
+    corrector.project(adata_new, batch_key="batch")
 
     assert "X_test_mnn_corrected" in adata_new.obsm
     assert adata_new.obsm["X_test_mnn_corrected"].shape == adata_new.obsm["X_test"].shape
@@ -299,16 +301,91 @@ def test_corrector_project_reduces_distance() -> None:
 
     adata_new = ad.AnnData(
         X=np.zeros((20, 4)),
-        obs=pd.DataFrame(index=[f"new_{i}" for i in range(20)]),
+        obs=pd.DataFrame({"batch": ["batch1"] * 20}, index=[f"new_{i}" for i in range(20)]),
     )
     adata_new.obsm["X_test"] = _make_batch(20, 8, 3.0, seed=101)
-    corrector.project(adata_new, batch_label="batch1")
+    corrector.project(adata_new, batch_key="batch")
 
     ref_mask = adata.obs["batch"] == "batch0"
     ref_center = adata.obsm["X_test"][ref_mask].mean(axis=0)
     before = adata_new.obsm["X_test"].mean(axis=0)
     after = adata_new.obsm["X_test_mnn_corrected"].mean(axis=0)
 
+    assert np.linalg.norm(after - ref_center) < np.linalg.norm(before - ref_center)
+
+
+def test_corrector_project_first_batch_is_identity() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    adata_new = ad.AnnData(
+        X=np.zeros((12, 4)),
+        obs=pd.DataFrame({"batch": ["batch0"] * 12}, index=[f"new_ref_{i}" for i in range(12)]),
+    )
+    adata_new.obsm["X_test"] = _make_batch(12, 8, 0.0, seed=202)
+
+    corrector.project(adata_new, batch_key="batch")
+
+    np.testing.assert_allclose(adata_new.obsm["X_test_mnn_corrected"], adata_new.obsm["X_test"])
+
+
+def test_corrector_project_fixed_reference_is_identity() -> None:
+    adata = _make_combined_adata(n_batches=3, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        reference="batch1",
+        use_rep="X_test",
+    )
+
+    adata_new = ad.AnnData(
+        X=np.zeros((12, 4)),
+        obs=pd.DataFrame({"batch": ["batch1"] * 12}, index=[f"new_fixed_ref_{i}" for i in range(12)]),
+    )
+    adata_new.obsm["X_test"] = _make_batch(12, 8, 3.0, seed=303)
+
+    corrector.project(adata_new, batch_key="batch")
+
+    np.testing.assert_allclose(adata_new.obsm["X_test_mnn_corrected"], adata_new.obsm["X_test"])
+
+
+def test_corrector_project_mixed_batches_uses_per_batch_models() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    emb_ref = _make_batch(10, 8, 0.0, seed=404)
+    emb_query = _make_batch(10, 8, 3.0, seed=405)
+    adata_new = ad.AnnData(
+        X=np.zeros((20, 4)),
+        obs=pd.DataFrame(
+            {"batch": ["batch0"] * 10 + ["batch1"] * 10},
+            index=[f"mixed_{i}" for i in range(20)],
+        ),
+    )
+    adata_new.obsm["X_test"] = np.vstack([emb_ref, emb_query])
+
+    corrector.project(adata_new, batch_key="batch")
+
+    np.testing.assert_allclose(
+        adata_new.obsm["X_test_mnn_corrected"][:10],
+        adata_new.obsm["X_test"][:10],
+    )
+    ref_center = adata.obsm["X_test"][adata.obs["batch"] == "batch0"].mean(axis=0)
+    before = adata_new.obsm["X_test"][10:].mean(axis=0)
+    after = adata_new.obsm["X_test_mnn_corrected"][10:].mean(axis=0)
     assert np.linalg.norm(after - ref_center) < np.linalg.norm(before - ref_center)
 
 
@@ -332,12 +409,61 @@ def test_corrector_project_unknown_batch_raises() -> None:
 
     adata_new = ad.AnnData(
         X=np.zeros((5, 4)),
-        obs=pd.DataFrame(index=[f"new_{i}" for i in range(5)]),
+        obs=pd.DataFrame({"batch": ["missing"] * 5}, index=[f"new_{i}" for i in range(5)]),
     )
     adata_new.obsm["X_test"] = _make_batch(5, 8, 2.0, seed=123)
 
-    with pytest.raises(KeyError, match="missing"):
-        corrector.project(adata_new, batch_label="missing")
+    with pytest.raises(ValueError, match="missing"):
+        corrector.project(adata_new, batch_key="batch")
+
+
+def test_corrector_project_ignores_unused_categorical_levels() -> None:
+    adata = _make_combined_adata(n_batches=2, shift_scale=3.0)
+    corrector = MNNCorrector(k_mnn=5, k_propagate=12, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    adata_new = ad.AnnData(
+        X=np.zeros((10, 4)),
+        obs=pd.DataFrame(
+            {
+                "batch": pd.Categorical(
+                    ["batch1"] * 10,
+                    categories=["batch0", "batch1", "unused_batch"],
+                )
+            },
+            index=[f"cat_{i}" for i in range(10)],
+        ),
+    )
+    adata_new.obsm["X_test"] = _make_batch(10, 8, 3.0, seed=125)
+
+    corrector.project(adata_new, batch_key="batch")
+
+    assert "X_test_mnn_corrected" in adata_new.obsm
+
+
+def test_corrector_project_missing_batch_key_raises() -> None:
+    adata = _make_combined_adata(n_batches=2)
+    corrector = MNNCorrector(k_mnn=5, verbose=False)
+    corrector.fit(
+        adata,
+        batch_key="batch",
+        batch_order=["batch0", "batch1"],
+        use_rep="X_test",
+    )
+
+    adata_new = ad.AnnData(
+        X=np.zeros((5, 4)),
+        obs=pd.DataFrame(index=[f"new_{i}" for i in range(5)]),
+    )
+    adata_new.obsm["X_test"] = _make_batch(5, 8, 2.0, seed=124)
+
+    with pytest.raises(KeyError, match="batch_key"):
+        corrector.project(adata_new, batch_key="batch")
 
 
 def test_corrector_correct_requires_same_cells() -> None:
@@ -389,8 +515,9 @@ def test_corrector_sparse_pca_project_raises() -> None:
     )
 
     _, adata_new = _make_sparse_adata_pair(n_ref=20, n_query=20, d=12, shift=1.0, seed=22)
+    adata_new.obs["batch"] = "batch1"
     with pytest.raises(ValueError, match="Projection is unavailable"):
-        corrector.project(adata_new, batch_label="batch1")
+        corrector.project(adata_new, batch_key="batch")
 
 
 def test_mnn_correct_returns_fitted_corrector() -> None:

@@ -7,7 +7,7 @@ supports three steps:
 1. `fit()` estimates per-batch displacement models.
 2. `correct()` applies the fitted correction to the training dataset.
 3. `project()` propagates an already learned batch displacement onto new cells
-   from the same batch label.
+	based on a batch column in the query `AnnData`.
 
 By default, `fit()` updates the current `MNNCorrector` in place and returns
 `None`. Pass `return_corrector=True` if you want it to return the fitted
@@ -83,20 +83,24 @@ corrector.correct(adata)
 corrected = adata.obsm["X_scVI_mnn_corrected"]
 ```
 
-### 3. Project new cells from a fitted batch
+### 3. Project new cells from fitted batches
 
 ```python
+new_adata.obs["batch"] = ["query_b", "query_b", "reference", ...]
+
 corrector.project(
 	new_adata,
-	batch_label="query_b",
+	batch_key="batch",
 )
 
 projected = new_adata.obsm["X_scVI_mnn_corrected"]
 ```
 
-`project()` is intended for new cells whose batch label has already been seen by
-`fit()`. If you need to apply the learned correction back to the original
-training dataset, use `correct()` instead.
+`project()` validates that every batch category in `new_adata.obs[batch_key]`
+was seen during `fit()`. Cells from the initial sequential batch or the fixed
+reference batch are projected as an identity mapping. If you need to apply the
+learned correction back to the original training dataset, use `correct()`
+instead.
 
 If `fit()` was run with `use_rep=None`, `project()` is unavailable because the
 PCA fallback is not stored as a reusable projection model.
@@ -193,9 +197,13 @@ You can override this with `key_added` in `fit()`, `correct()`, `project()`,
 	`return_corrector=True` is passed.
 - `correct()` applies only to the same fitted dataset and validates that both
   the cells and source representation match the fitted state.
-- `project()` is for new cells from a batch label already seen during `fit()`.
+- `project()` is for new cells whose batch assignments are stored in a column of
+	`adata.obs`, and every batch in that column must already be known from
+	`fit()`.
 - Projection state is stored per batch label in `corrector.projection_data_`
 	only when a reusable representation was supplied.
+- The initial sequential batch or fixed reference batch projects as an identity
+	mapping and is stored separately from `corrector.projection_data_`.
 - If `use_rep=None`, `fit()` falls back to PCA for the current correction and
 	forces `store_for_projection=False`.
 

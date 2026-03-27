@@ -51,6 +51,9 @@ class MNNCorrector:
         Mapping from fitted batch label to stored anchor embeddings,
         propagated displacements, and corrected embeddings used for
         projection.
+    projection_identity_batch_
+        Batch label that should project as an identity mapping because it was
+        used as the fixed reference or initial sequential batch during fit.
     key_added_
         Output key used by :meth:`correct` and :meth:`project` when writing
         corrected embeddings into ``adata.obsm``.
@@ -83,6 +86,7 @@ class MNNCorrector:
         self.n_query_with_mnn_: int = 0
 
         self.projection_data_: Dict[str, Dict[str, Any]] = {}
+        self.projection_identity_batch_: Optional[str] = None
         self.n_corrections_: int = 0
 
         self.batch_key_: Optional[str] = None
@@ -115,6 +119,7 @@ class MNNCorrector:
         self.n_mnn_pairs_ = 0
         self.n_query_with_mnn_ = 0
         self.projection_data_ = {}
+        self.projection_identity_batch_ = None
         self.n_corrections_ = 0
         self.batch_key_ = None
         self.batch_order_ = None
@@ -353,10 +358,22 @@ class MNNCorrector:
                 "Projection is unavailable for this fitted corrector. Fit with a reusable "
                 "representation in adata.obsm and store_for_projection=True."
             )
+        if batch_label == self.projection_identity_batch_:
+            if self.verbose:
+                tprint(
+                    f"[MNNCorrector.project] Batch '{batch_label}' was the fit reference; "
+                    "projection is an identity mapping."
+                )
+            return emb_new.copy()
         if batch_label not in self.projection_data_:
+            available_batches = sorted(self.projection_data_.keys())
+            if self.projection_identity_batch_ is not None:
+                available_batches = sorted(
+                    available_batches + [self.projection_identity_batch_]
+                )
             raise KeyError(
                 f"No projection data stored for batch '{batch_label}'. "
-                f"Available batches: {sorted(self.projection_data_.keys())}."
+                f"Available batches: {available_batches}."
             )
 
         batch_model = self.projection_data_[batch_label]
@@ -386,6 +403,24 @@ class MNNCorrector:
             verbose=self.verbose,
         )
         return emb_new + np.asarray(displacement)
+
+    def _get_project_labels(self, batch_values: pd.Series) -> List[str]:
+        """Collect batch labels that must be valid for projection.
+
+        Parameters
+        ----------
+        batch_values
+            Batch assignments for the query AnnData.
+
+        Returns
+        -------
+        list[str]
+            Labels that must resolve to either the identity batch or a stored
+            projection model.
+        """
+        if batch_values.isna().any():
+            raise ValueError("project() does not support missing batch labels.")
+        return pd.Index(pd.unique(batch_values)).tolist()
 
     def fit(
         self,
@@ -491,6 +526,7 @@ class MNNCorrector:
         if reference is None:
             order = batch_order if batch_order is not None else observed
             self.batch_order_ = list(order)
+            self.projection_identity_batch_ = order[0] if self.store_for_projection else None
             if self.verbose:
                 tprint(f"[MNNCorrector.fit] Sequential mode -- batch order: {order}")
 
@@ -521,6 +557,9 @@ class MNNCorrector:
         else:
             ref_mask = (batch_values == reference).to_numpy()
             query_labels = [label for label in observed if label != reference]
+            self.projection_identity_batch_ = (
+                reference if self.store_for_projection else None
+            )
             if self.verbose:
                 tprint(
                     f"[MNNCorrector.fit] Fixed-reference mode -- reference='{reference}', "
@@ -634,7 +673,7 @@ class MNNCorrector:
     def project(
         self,
         adata: AnnData,
-        batch_label: str,
+        batch_key: str,
         use_rep: Optional[str] = None,
         key_added: Optional[str] = None,
         use_propagated: bool = True,
@@ -645,9 +684,10 @@ class MNNCorrector:
         Parameters
         ----------
         adata
-            AnnData containing new cells from a previously fitted batch.
-        batch_label
-            Batch label whose fitted displacement model should be reused.
+            AnnData containing new cells from previously fitted batches.
+        batch_key
+            Column in ``adata.obs`` identifying which fitted batch model
+            should be applied to each cell.
         use_rep
             Optional representation key. This must match the representation
             used during fitting.
@@ -664,9 +704,39 @@ class MNNCorrector:
         -------
         AnnData or None
             Corrected copy when ``copy=True``; otherwise ``None``.
+
+        Raises
+        ------
+        KeyError
+            If ``batch_key`` is not present in ``adata.obs``.
+        ValueError
+            If batch labels are missing or reference unfitted batches.
         """
+        if batch_key not in adata.obs.columns:
+            raise KeyError(f"batch_key '{batch_key}' not found in adata.obs.")
+
         emb_new = self._resolve_project_representation(adata, use_rep)
-        corrected = self._project_embeddings(emb_new, batch_label, use_propagated)
+        batch_values = adata.obs[batch_key]
+        batch_labels = self._get_project_labels(batch_values)
+        valid_labels = set(self.projection_data_)
+        if self.projection_identity_batch_ is not None:
+            valid_labels.add(self.projection_identity_batch_)
+
+        invalid_labels = [label for label in batch_labels if label not in valid_labels]
+        if invalid_labels:
+            raise ValueError(
+                "project() received batch labels without fitted projection state: "
+                f"{sorted(invalid_labels)}. Available batches: {sorted(valid_labels)}."
+            )
+
+        corrected = np.empty_like(emb_new)
+        for label in pd.Index(pd.unique(batch_values)):
+            mask = (batch_values == label).to_numpy()
+            corrected[mask] = self._project_embeddings(
+                emb_new[mask],
+                str(label),
+                use_propagated,
+            )
 
         target = adata.copy() if copy else adata
         target_key = key_added or self.key_added_
