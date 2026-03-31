@@ -15,10 +15,10 @@ corrector instance for chaining.
 
 ## Installation
 
-Install the package in editable mode for development:
+Install the package with `pip` in your existing Python environment:
 
 ```bash
-pip install -e ".[dev]"
+pip install .
 ```
 
 Core runtime dependencies are listed in [pyproject.toml](pyproject.toml).
@@ -218,22 +218,41 @@ You can override this with `key_added` in `fit()`, `correct()`, `project()`,
 
 ## Development
 
+For contributor setup, this repository also supports `uv` with the checked-in
+`uv.lock` file:
+
+```bash
+uv sync --frozen --extra dev
+```
+
+If `uv` needs the pinned Python version first:
+
+```bash
+uv python install 3.10.19
+```
+
+Run the package commands in that environment with `uv run`, for example:
+
+```bash
+uv run pytest
+```
+
 Run the test suite:
 
 ```bash
-pytest
+uv run pytest
 ```
 
 Run linting:
 
 ```bash
-ruff check src tests
+uv run ruff check src tests
 ```
 
 Run type checking:
 
 ```bash
-mypy src
+uv run mypy src
 ```
 
 ## License
