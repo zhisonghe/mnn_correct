@@ -13,6 +13,17 @@ By default, `fit()` updates the current `MNNCorrector` in place and returns
 `None`. Pass `return_corrector=True` if you want it to return the fitted
 corrector instance for chaining.
 
+Compared with `mnnpy`, `mnn-correct` uses a different correction mechanism and
+workflow. `mnnpy` follows the classic pattern of finding MNN pairs, averaging
+pairwise correction vectors, and smoothing them with a Gaussian kernel
+controlled by `sigma`, with optional variance adjustment and biological
+subspace correction. By contrast, `mnn-correct` treats MNN-supported query
+cells as anchors, estimates their displacements, and propagates those
+displacements across the full batch with a configurable weighted KNN graph
+(default: `jaccard_square`). It also retains fitted batch-specific state so the
+learned correction can later be projected onto new cells from already seen
+batches.
+
 ## Installation
 
 Install the package with `pip` in your existing Python environment:
