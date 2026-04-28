@@ -7,6 +7,7 @@ from .wknn import (
     get_wknn,
     nn2adj,
     gaussian_kernel,
+    run_nn,
 )
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "get_wknn",
     "nn2adj",
     "gaussian_kernel",
+    "run_nn",
     "propagate_weighted",
 ]
