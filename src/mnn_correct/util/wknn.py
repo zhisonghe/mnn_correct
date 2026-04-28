@@ -97,16 +97,14 @@ def nn2adj(
     return adj
 
 
-def build_nn(
+def run_nn(
     ref,
-    query=None,
+    query,
     k: int = 100,
-    weight: Literal["unweighted", "dist", "gaussian_kernel"] = "unweighted",
-    sigma=None,
     flavor: NeighborFlavor = "auto",
     verbose: bool = False,
 ):
-    """Build a k-nearest-neighbour graph from *query* into *ref*.
+    """Run k-nearest-neighbour search and return a pynndescent-style tuple.
 
     Supports exact CPU neighbours via scikit-learn, approximate CPU neighbours
     via :class:`~pynndescent.NNDescent`, and GPU neighbours via cuML.
@@ -117,6 +115,92 @@ def build_nn(
        1000 cells.
     2. Otherwise use cuML when CUDA is available and ``cuml`` is installed.
     3. Otherwise fall back to pynndescent.
+
+    Parameters
+    ----------
+    ref
+        Reference embedding, shape ``(n_ref, d)``.
+    query
+        Query embedding, shape ``(n_query, d)``.
+    k
+        Number of neighbours per query cell.
+    flavor
+        Neighbor-search backend. One of ``"auto"``, ``"cuml"``,
+        ``"sklearn"``, or ``"pynndescent"``.
+    verbose
+        Print backend selection message.
+
+    Returns
+    -------
+    tuple
+        ``(indices, distances)`` arrays, each of shape ``(n_query, k)``.
+    """
+    if flavor not in ("auto", "cuml", "sklearn", "pynndescent"):
+        raise ValueError(
+            f"Unsupported flavor '{flavor}'. Expected one of "
+            "'auto', 'cuml', 'sklearn', or 'pynndescent'."
+        )
+
+    has_gpu = torch.cuda.is_available()
+    has_cuml = importlib.util.find_spec("cuml") is not None
+
+    if flavor == "auto":
+        if ref.shape[0] < 1000 and query.shape[0] < 1000:
+            backend = "sklearn"
+        elif has_gpu and has_cuml:
+            backend = "cuml"
+        else:
+            backend = "pynndescent"
+    else:
+        backend = flavor
+
+    if backend == "cuml":
+        if not has_gpu or not has_cuml:
+            raise RuntimeError(
+                "flavor='cuml' requires both CUDA availability and the cuml package."
+            )
+        if verbose:
+            _tprint(
+                f"[run_nn] Using cuML for neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
+        from cuml.neighbors import NearestNeighbors
+
+        model = NearestNeighbors(n_neighbors=k)
+        model.fit(ref)
+        knn = (model.kneighbors(query)[1], model.kneighbors(query)[0])
+    elif backend == "sklearn":
+        if verbose:
+            _tprint(
+                f"[run_nn] Using scikit-learn for exact neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
+        model = SklearnNearestNeighbors(n_neighbors=k)
+        model.fit(ref)
+        distances, indices = model.kneighbors(query)
+        knn = (indices, distances)
+    else:
+        if verbose:
+            _tprint(
+                f"[run_nn] Using pynndescent for approximate neighborhood estimation "
+                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
+            )
+        index = NNDescent(ref)
+        knn = index.query(query, k=k)
+
+    return knn
+
+
+def build_nn(
+    ref,
+    query=None,
+    k: int = 100,
+    weight: Literal["unweighted", "dist", "gaussian_kernel"] = "unweighted",
+    sigma=None,
+    flavor: NeighborFlavor = "auto",
+    verbose: bool = False,
+):
+    """Build a k-nearest-neighbour graph from *query* into *ref*.
 
     Parameters
     ----------
@@ -144,59 +228,7 @@ def build_nn(
     if query is None:
         query = ref
 
-    if flavor not in ("auto", "cuml", "sklearn", "pynndescent"):
-        raise ValueError(
-            f"Unsupported flavor '{flavor}'. Expected one of "
-            "'auto', 'cuml', 'sklearn', or 'pynndescent'."
-        )
-
-    has_gpu = torch.cuda.is_available()
-    has_cuml = importlib.util.find_spec("cuml") is not None
-
-    if flavor == "auto":
-        if ref.shape[0] < 1000 and query.shape[0] < 1000:
-            backend = "sklearn"
-        elif has_gpu and has_cuml:
-            backend = "cuml"
-        else:
-            backend = "pynndescent"
-    else:
-        backend = flavor
-
-    if backend == "cuml":
-        if not has_gpu or not has_cuml:
-            raise RuntimeError(
-                "flavor='cuml' requires both CUDA availability and the cuml package."
-            )
-        if verbose:
-            _tprint(
-                f"[build_nn] Using cuML for neighborhood estimation "
-                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
-            )
-        from cuml.neighbors import NearestNeighbors
-
-        model = NearestNeighbors(n_neighbors=k)
-        model.fit(ref)
-        knn = (model.kneighbors(query)[1], model.kneighbors(query)[0])
-    elif backend == "sklearn":
-        if verbose:
-            _tprint(
-                f"[build_nn] Using scikit-learn for exact neighborhood estimation "
-                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
-            )
-        model = SklearnNearestNeighbors(n_neighbors=k)
-        model.fit(ref)
-        distances, indices = model.kneighbors(query)
-        knn = (indices, distances)
-    else:
-        if verbose:
-            _tprint(
-                f"[build_nn] Using pynndescent for approximate neighborhood estimation "
-                f"(k={k}, n_ref={ref.shape[0]:,}, n_query={query.shape[0]:,})..."
-            )
-        index = NNDescent(ref)
-        knn = index.query(query, k=k)
-
+    knn = run_nn(ref=ref, query=query, k=k, flavor=flavor, verbose=verbose)
     return nn2adj(knn, n1=query.shape[0], n2=ref.shape[0], weight=weight, sigma=sigma)
 
 
