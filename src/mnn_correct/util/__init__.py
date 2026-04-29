@@ -5,6 +5,7 @@ from .wknn import (
     build_nn,
     build_mutual_nn,
     get_wknn,
+    knn_tuple_to_scanpy_neighbors,
     nn2adj,
     gaussian_kernel,
     run_nn,
@@ -21,4 +22,5 @@ __all__ = [
     "gaussian_kernel",
     "run_nn",
     "propagate_weighted",
+    "knn_tuple_to_scanpy_neighbors",
 ]

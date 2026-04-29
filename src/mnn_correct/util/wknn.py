@@ -450,8 +450,6 @@ def get_wknn(
 
     return wknn
 
-ConnectivityFlavor = Literal["umap", "gaussian", "jaccard", "jaccard_square", "unweighted"]
-
 
 def knn_tuple_to_scanpy_neighbors(
     adata,
@@ -460,7 +458,7 @@ def knn_tuple_to_scanpy_neighbors(
     metric="euclidean",
     random_state=0,
     use_rep=None,
-    connectivity_flavor: ConnectivityFlavor = "umap",
+    connectivity_flavor: Literal["umap", "gaussian", "jaccard", "jaccard_square", "unweighted"] = "umap",
     sigma=None,
 ):
     """
