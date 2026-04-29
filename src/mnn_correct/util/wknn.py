@@ -10,6 +10,8 @@ from typing import Literal, Optional
 import numpy as np
 import pandas as pd
 import torch
+import scipy.sparse as sp
+from umap.umap_ import fuzzy_simplicial_set
 from pynndescent import NNDescent
 from scipy import sparse
 from sklearn.neighbors import NearestNeighbors as SklearnNearestNeighbors
@@ -290,6 +292,45 @@ def build_mutual_nn(
     return adj_12.multiply(adj_21.T)
 
 
+def _jaccard_weights(
+    adj_left,
+    adj_right,
+    support,
+    k: int,
+    square: bool = False,
+):
+    """Compute Jaccard (or squared-Jaccard) edge weights.
+
+    Parameters
+    ----------
+    adj_left
+        Binary directed adjacency, shape ``(n, m)``.
+    adj_right
+        Binary directed adjacency, shape ``(p, m)``.
+    support
+        Binary mask of edges to weight, shape ``(n, p)``.  Only positions
+        that are non-zero in *support* receive a weight.
+    k
+        Number of neighbours used to build each adjacency.  Used as both
+        ``|N(i)|`` and ``|N(j)|`` in the Jaccard denominator
+        ``|N(i) ∩ N(j)| / (k + k − |N(i) ∩ N(j)|)``.
+    square
+        If ``True``, return squared Jaccard values.
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix
+        Sparse matrix the same shape as *support* containing Jaccard weights
+        for edges present in *support*.
+    """
+    num_shared = adj_left @ adj_right.T  # (n, p) shared-neighbor counts
+    weights = num_shared.multiply(support).copy()
+    weights.data = weights.data / (k + k - weights.data)
+    if square:
+        weights.data **= 2
+    return weights
+
+
 def get_wknn(
     ref,
     query,
@@ -381,17 +422,18 @@ def get_wknn(
         if ref2 is None:
             ref2 = ref
         adj_ref = build_nn(ref=ref2, k=k, flavor=flavor, verbose=verbose)
-        num_shared = adj_q2r @ adj_ref.T
-        wknn = num_shared.multiply(adj_knn.T).copy()
-
-        if weighting_scheme == "top_n":
-            if top_n is None:
-                top_n = k // 4 if k > 4 else 1
-            wknn = (wknn > top_n) * 1
-        elif weighting_scheme == "jaccard":
-            wknn.data = wknn.data / (k + k - wknn.data)
-        elif weighting_scheme == "jaccard_square":
-            wknn.data = (wknn.data / (k + k - wknn.data)) ** 2
+        if weighting_scheme in ("jaccard", "jaccard_square"):
+            wknn = _jaccard_weights(
+                adj_q2r, adj_ref, adj_knn.T, k,
+                square=(weighting_scheme == "jaccard_square"),
+            )
+        else:
+            num_shared = adj_q2r @ adj_ref.T
+            wknn = num_shared.multiply(adj_knn.T).copy()
+            if weighting_scheme == "top_n":
+                if top_n is None:
+                    top_n = k // 4 if k > 4 else 1
+                wknn = (wknn > top_n) * 1
     else:
         wknn = adj_knn.T
         if weighting_scheme == "gaussian":
@@ -407,3 +449,183 @@ def get_wknn(
         return wknn, adjs
 
     return wknn
+
+ConnectivityFlavor = Literal["umap", "gaussian", "jaccard", "jaccard_square", "unweighted"]
+
+
+def knn_tuple_to_scanpy_neighbors(
+    adata,
+    knn_tuple,
+    key_added=None,
+    metric="euclidean",
+    random_state=0,
+    use_rep=None,
+    connectivity_flavor: ConnectivityFlavor = "umap",
+    sigma=None,
+):
+    """
+    Convert a PyNNDescent/UMAP-style kNN tuple into Scanpy-compatible neighbors.
+
+    Parameters
+    ----------
+    adata
+        AnnData object with n_obs matching the kNN graph.
+    knn_tuple
+        Either (knn_indices, knn_dists) or (knn_indices, knn_dists, search_index).
+    key_added
+        If None, writes to the default Scanpy locations:
+            adata.obsp["distances"]
+            adata.obsp["connectivities"]
+            adata.uns["neighbors"]
+        If not None, writes to:
+            adata.obsp[f"{key_added}_distances"]
+            adata.obsp[f"{key_added}_connectivities"]
+            adata.uns[key_added]
+    metric
+        Metric used to compute the kNN distances.
+    random_state
+        Random state used by UMAP's fuzzy simplicial set construction
+        (only used when ``connectivity_flavor="umap"``).
+    use_rep
+        Key in ``adata.obsm`` that was used to build the kNN graph (e.g.
+        ``"X_pca"``).  Stored in ``adata.uns[...]["params"]["use_rep"]`` so
+        that ``sc.tl.umap`` selects the matching representation for its
+        spectral initialisation and connected-component detection, instead of
+        falling back to ``adata.X`` (or silently re-running PCA).
+    connectivity_flavor
+        How to compute the connectivities matrix:
+
+        * ``"umap"`` *(default)* — UMAP's fuzzy simplicial set via
+          :func:`~umap.umap_.fuzzy_simplicial_set`.  Edge weights encode
+          the fuzzy membership strength with a per-cell adaptive bandwidth.
+          Produces the same result as ``sc.pp.neighbors``.
+        * ``"gaussian"`` — Gaussian-kernel-transformed distances,
+          symmetrised via the fuzzy union ``A + Aᵀ − A ∘ Aᵀ``.  A simpler
+          and faster alternative that is still distance-aware.  Use *sigma*
+          to control the kernel bandwidth.
+        * ``"jaccard"`` — Jaccard index of shared k-nearest-neighbour sets,
+          restricted to edges present in the symmetric kNN graph.  The weight
+          of edge ``(i, j)`` is ``|N(i) ∩ N(j)| / |N(i) ∪ N(j)|``.
+        * ``"jaccard_square"`` — Square of the Jaccard index.  Penalises
+          weak overlaps more strongly; consistent with the default
+          ``weighting_scheme`` in :func:`get_wknn`.
+        * ``"unweighted"`` — Binary adjacency (edge present iff at least one
+          direction has the neighbour), symmetrised via the same fuzzy union.
+          Fastest option; treats all edges equally.
+
+        ``sc.tl.umap`` emits a harmless warning when the flavor is not
+        ``"umap"`` because ``params["method"]`` will not be ``"umap"``.
+        Clustering with ``sc.tl.leiden`` is unaffected.
+    sigma
+        Gaussian kernel bandwidth.  Only used when
+        ``connectivity_flavor="gaussian"``.  Defaults to
+        ``max(distances) / 3`` (the same default as :func:`gaussian_kernel`).
+    """
+    if connectivity_flavor not in ("umap", "gaussian", "jaccard", "jaccard_square", "unweighted"):
+        raise ValueError(
+            f"Unsupported connectivity_flavor '{connectivity_flavor}'. "
+            "Expected one of 'umap', 'gaussian', 'jaccard', 'jaccard_square', or 'unweighted'."
+        )
+
+    knn_indices = np.asarray(knn_tuple[0])
+    knn_dists = np.asarray(knn_tuple[1])
+
+    n_cells = adata.n_obs
+
+    if knn_indices.shape != knn_dists.shape:
+        raise ValueError("knn_indices and knn_dists must have the same shape.")
+
+    if knn_indices.shape[0] != n_cells:
+        raise ValueError(
+            f"adata.n_obs is {n_cells}, but kNN graph has {knn_indices.shape[0]} rows."
+        )
+
+    n_neighbors = knn_indices.shape[1]
+
+    # Sparse distance matrix: rows are source cells, columns are neighbor cells.
+    rows = np.repeat(np.arange(n_cells), n_neighbors)
+    cols = knn_indices.ravel()
+    vals = knn_dists.ravel()
+
+    valid = cols >= 0
+    rows = rows[valid]
+    cols = cols[valid]
+    vals = vals[valid]
+
+    distances = sp.csr_matrix(
+        (vals, (rows, cols)),
+        shape=(n_cells, n_cells),
+    )
+
+    if connectivity_flavor == "umap":
+        # UMAP's fuzzy simplicial set with per-cell adaptive bandwidth.
+        # When knn_indices/knn_dists are pre-supplied, fuzzy_simplicial_set only
+        # reads X.shape[0] to size the output matrix, so a lightweight proxy is
+        # enough and avoids failures when adata.X is None or backed.
+        _X_proxy = np.empty((n_cells, 1), dtype=np.float32)
+        connectivities, _, _ = fuzzy_simplicial_set(
+            X=_X_proxy,
+            n_neighbors=n_neighbors,
+            random_state=np.random.RandomState(random_state),
+            metric=metric,
+            knn_indices=knn_indices,
+            knn_dists=knn_dists,
+        )
+        method = "umap"
+    elif connectivity_flavor in ("jaccard", "jaccard_square"):
+        adj = nn2adj(
+            (knn_indices, knn_dists),
+            n1=n_cells,
+            n2=n_cells,
+            weight="unweighted",
+        )
+        adj_sym = adj + adj.T - adj.multiply(adj.T)  # symmetric kNN support
+        connectivities = _jaccard_weights(
+            adj, adj, adj_sym, n_neighbors,
+            square=(connectivity_flavor == "jaccard_square"),
+        )
+        method = connectivity_flavor
+    else:
+        # Build a directed adjacency from the knn_tuple, then symmetrise using
+        # the fuzzy union: A + Aᵀ − A ∘ Aᵀ  (same as UMAP's set_op_mix_ratio=1).
+        weight = "gaussian_kernel" if connectivity_flavor == "gaussian" else "unweighted"
+        adj = nn2adj(
+            (knn_indices, knn_dists),
+            n1=n_cells,
+            n2=n_cells,
+            weight=weight,
+            sigma=sigma,
+        )
+        connectivities = adj + adj.T - adj.multiply(adj.T)
+        method = connectivity_flavor
+
+    connectivities = connectivities.tocsr()
+    distances = distances.tocsr()
+
+    if key_added is None:
+        neighbors_key = "neighbors"
+        distances_key = "distances"
+        connectivities_key = "connectivities"
+    else:
+        neighbors_key = key_added
+        distances_key = f"{key_added}_distances"
+        connectivities_key = f"{key_added}_connectivities"
+
+    adata.obsp[distances_key] = distances
+    adata.obsp[connectivities_key] = connectivities
+
+    params = {
+        "n_neighbors": n_neighbors,
+        "method": method,
+        "metric": metric,
+    }
+    if use_rep is not None:
+        params["use_rep"] = use_rep
+
+    adata.uns[neighbors_key] = {
+        "connectivities_key": connectivities_key,
+        "distances_key": distances_key,
+        "params": params,
+    }
+
+    return adata
